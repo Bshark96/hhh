@@ -1,9 +1,18 @@
 package com.example.ui.components
 
 import android.appwidget.AppWidgetHost
+import android.appwidget.AppWidgetHostView
 import android.appwidget.AppWidgetManager
+import android.appwidget.AppWidgetProviderInfo
 import android.content.ComponentName
+import android.content.Context
+import android.view.MotionEvent
+import android.view.ViewConfiguration
 import androidx.activity.compose.BackHandler
+import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.FastOutSlowInEasing
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
@@ -20,13 +29,16 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.grid.GridCells
@@ -36,18 +48,22 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.AccessTime
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Apps
 import androidx.compose.material.icons.filled.BatteryChargingFull
+import androidx.compose.material.icons.filled.CalendarMonth
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.CreateNewFolder
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Edit
+import androidx.compose.material.icons.filled.LocationOn
 import androidx.compose.material.icons.filled.OpenInFull
 import androidx.compose.material.icons.filled.Palette
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Storage
+import androidx.compose.material.icons.filled.WbSunny
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -62,28 +78,35 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.withFrameMillis
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Rect
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.boundsInRoot
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
@@ -100,6 +123,7 @@ import com.example.domain.model.HyperWidgetType
 import com.example.domain.model.IconResolutionSource
 import com.example.domain.model.InstalledAppItem
 import com.example.domain.model.LauncherEngineConfig
+import com.example.domain.model.MiuiFolderAnimationMode
 import com.example.domain.model.MtzThemeMetadata
 import com.example.domain.model.SystemWidgetProviderItem
 import com.example.domain.model.WorkspaceFolder
@@ -116,9 +140,157 @@ import com.example.ui.theme.SlateSurfaceElevated
 import com.example.ui.theme.TextMuted
 import com.example.ui.theme.TextPrimary
 import com.example.ui.theme.TextSecondary
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import java.text.SimpleDateFormat
+import java.util.Date
 import java.util.Locale
+import kotlin.math.hypot
+
+/**
+ * Custom [AppWidgetHost] that creates [LauncherAppWidgetHostView] instances so native Android
+ * `RemoteViews` widgets pass normal taps/scrolls through to the bound widget while still triggering
+ * MIUI long-press resize/drag edit mode when held down.
+ */
+class LauncherAppWidgetHost(
+    context: Context,
+    hostId: Int
+) : AppWidgetHost(context, hostId) {
+    override fun onCreateView(
+        context: Context,
+        appWidgetId: Int,
+        appWidget: AppWidgetProviderInfo?
+    ): AppWidgetHostView {
+        return LauncherAppWidgetHostView(context)
+    }
+}
+
+class LauncherAppWidgetHostView(context: Context) : AppWidgetHostView(context) {
+    var isEditModeActive: Boolean = false
+    var onTapInEditModeListener: (() -> Unit)? = null
+    var onLongPressListener: (() -> Unit)? = null
+    var onReleaseWithoutDragListener: (() -> Unit)? = null
+    var onStartDragListener: ((Float, Float) -> Unit)? = null
+    var onDragMoveListener: ((Float, Float) -> Unit)? = null
+    var onDragDropListener: ((Float, Float) -> Unit)? = null
+    var onDragCancelListener: (() -> Unit)? = null
+
+    private var downX = 0f
+    private var downY = 0f
+    private var longPressTriggered = false
+    private var isDraggingWidget = false
+    private val touchSlop = ViewConfiguration.get(context).scaledTouchSlop
+
+    init {
+        setPadding(0, 0, 0, 0)
+    }
+
+    private val longPressRunnable = Runnable {
+        if (!isDraggingWidget) {
+            longPressTriggered = true
+            parent?.requestDisallowInterceptTouchEvent(true)
+            onLongPressListener?.invoke()
+        }
+    }
+
+    override fun onInterceptTouchEvent(ev: MotionEvent): Boolean {
+        when (ev.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                downX = ev.x
+                downY = ev.y
+                longPressTriggered = false
+                isDraggingWidget = false
+                removeCallbacks(longPressRunnable)
+                if (isEditModeActive) {
+                    parent?.requestDisallowInterceptTouchEvent(true)
+                    return true
+                }
+                postDelayed(longPressRunnable, ViewConfiguration.getLongPressTimeout().toLong())
+            }
+            MotionEvent.ACTION_MOVE -> {
+                val dist = hypot(ev.x - downX, ev.y - downY)
+                if (longPressTriggered || isEditModeActive) {
+                    return true
+                }
+                if (dist > touchSlop) {
+                    removeCallbacks(longPressRunnable)
+                }
+            }
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                removeCallbacks(longPressRunnable)
+                if (longPressTriggered || isDraggingWidget || isEditModeActive) {
+                    return true
+                }
+            }
+        }
+        return if (longPressTriggered || isEditModeActive) true else super.onInterceptTouchEvent(ev)
+    }
+
+    override fun onTouchEvent(ev: MotionEvent): Boolean {
+        when (ev.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                downX = ev.x
+                downY = ev.y
+                if (!isEditModeActive && !longPressTriggered) {
+                    removeCallbacks(longPressRunnable)
+                    postDelayed(longPressRunnable, ViewConfiguration.getLongPressTimeout().toLong())
+                }
+                return true
+            }
+            MotionEvent.ACTION_MOVE -> {
+                val dist = hypot(ev.x - downX, ev.y - downY)
+                if (!longPressTriggered && !isEditModeActive && dist > touchSlop) {
+                    removeCallbacks(longPressRunnable)
+                    return false
+                }
+                if ((longPressTriggered || isEditModeActive) && !isDraggingWidget && dist > touchSlop) {
+                    isDraggingWidget = true
+                    parent?.requestDisallowInterceptTouchEvent(true)
+                    onStartDragListener?.invoke(ev.x, ev.y)
+                }
+                if (isDraggingWidget) {
+                    onDragMoveListener?.invoke(ev.x, ev.y)
+                }
+                return true
+            }
+            MotionEvent.ACTION_UP -> {
+                removeCallbacks(longPressRunnable)
+                when {
+                    isDraggingWidget -> {
+                        isDraggingWidget = false
+                        longPressTriggered = false
+                        onDragDropListener?.invoke(ev.x, ev.y)
+                    }
+                    longPressTriggered -> {
+                        longPressTriggered = false
+                        onReleaseWithoutDragListener?.invoke()
+                    }
+                    isEditModeActive -> {
+                        onTapInEditModeListener?.invoke()
+                    }
+                }
+                return true
+            }
+            MotionEvent.ACTION_CANCEL -> {
+                removeCallbacks(longPressRunnable)
+                if (isDraggingWidget) {
+                    isDraggingWidget = false
+                    onDragCancelListener?.invoke()
+                } else if (longPressTriggered) {
+                    longPressTriggered = false
+                    onReleaseWithoutDragListener?.invoke()
+                }
+                return true
+            }
+        }
+        return super.onTouchEvent(ev)
+    }
+}
 
 private val MiuiResizeHandleBlue = Color(0xFF2196F3)
+private val MiuiFolderDragHighlightBlue = Color(0xFF38BDF8)
+private val sharedFolderMamlEngine by lazy { com.example.mtz.XiaomiIconRenderEngine() }
+private val sharedClockWidgetMamlRenderer by lazy { com.example.mtz.MamlClockWidgetRenderer() }
 
 private fun parseFolderPlateColor(hex: String): Color {
     return try {
@@ -159,13 +331,50 @@ fun HyperFolderCard(
     onDragFolder: (Offset) -> Unit = {},
     onEndDragFolder: (WorkspaceFolder, Offset) -> Unit = { _, _ -> },
     onCancelDragFolder: () -> Unit = {},
+    onReleaseFingerHold: () -> Unit = {},
+    isDragHovered: Boolean = false,
+    animRestartKey: Any = 0,
     iconSize: Dp = 58.dp,
     showLabel: Boolean = true,
+    activeTheme: MtzThemeMetadata? = null,
+    enableMtzWidgetStyling: Boolean = true,
     modifier: Modifier = Modifier
 ) {
-    val plateColor = remember(folder.backgroundColorHex) {
-        parseFolderPlateColor(folder.backgroundColorHex)
+    val mtzFolderBgBitmap = remember(activeTheme?.iconFolderPath, enableMtzWidgetStyling) {
+        if (!enableMtzWidgetStyling) {
+            null
+        } else {
+            activeTheme?.iconFolderPath?.let { path ->
+                runCatching { android.graphics.BitmapFactory.decodeFile(path)?.asImageBitmap() }.getOrNull()
+            }
+        }
     }
+    val mtzFolderCoverBitmap = remember(activeTheme?.folderCoverPath, enableMtzWidgetStyling) {
+        if (!enableMtzWidgetStyling) {
+            null
+        } else {
+            activeTheme?.folderCoverPath?.let { path ->
+                runCatching { android.graphics.BitmapFactory.decodeFile(path)?.asImageBitmap() }.getOrNull()
+            }
+        }
+    }
+    val basePlateColor = remember(folder.backgroundColorHex, mtzFolderBgBitmap) {
+        val parsed = parseFolderPlateColor(folder.backgroundColorHex)
+        if (mtzFolderBgBitmap != null) {
+            parsed.copy(alpha = (parsed.alpha * 0.28f).coerceAtMost(0.18f))
+        } else {
+            parsed
+        }
+    }
+    val plateColor = if (isDragHovered) {
+        MiuiFolderDragHighlightBlue.copy(alpha = 0.34f)
+    } else {
+        basePlateColor
+    }
+    val hoverScale by animateFloatAsState(
+        targetValue = if (isDragHovered) 1.045f else 1f,
+        label = "folderDragHoverScale"
+    )
     val density = LocalDensity.current
     val stepThresholdPx = with(density) { 46.dp.toPx() }
     val slotBoundsMap = remember(folder.id) { mutableStateMapOf<String, Rect>() }
@@ -175,7 +384,7 @@ fun HyperFolderCard(
         contentAlignment = Alignment.TopCenter,
         modifier = modifier
             .fillMaxSize()
-            .zIndex(if (isEditingFolder) 15f else 1f)
+            .zIndex(if (isEditingFolder || isDragHovered) 15f else 1f)
             .testTag("hyper_folder_${folder.id}")
     ) {
         val availW = maxWidth
@@ -230,16 +439,33 @@ fun HyperFolderCard(
             Box(
                 contentAlignment = Alignment.Center
             ) {
+                val folderCornerShape = RoundedCornerShape(
+                    if (folder.layoutMode == HyperFolderLayoutMode.REGULAR_1X1) 16.dp else 22.dp
+                )
                 Box(
                     contentAlignment = Alignment.Center,
                     modifier = Modifier
                         .size(width = cardSizeWidth, height = cardSizeHeight)
-                        .clip(RoundedCornerShape(if (folder.layoutMode == HyperFolderLayoutMode.REGULAR_1X1) 16.dp else 22.dp))
+                        .graphicsLayer {
+                            scaleX = hoverScale
+                            scaleY = hoverScale
+                        }
+                        .clip(folderCornerShape)
                         .background(plateColor)
                         .border(
-                            width = if (isEditingFolder) 1.8.dp else if (isWorkspaceEditMode) 1.3.dp else 0.8.dp,
-                            color = if (isEditingFolder) Color.White.copy(alpha = 0.92f) else if (isWorkspaceEditMode) Color.White.copy(alpha = 0.50f) else Color.White.copy(alpha = 0.22f),
-                            shape = RoundedCornerShape(22.dp)
+                            width = when {
+                                isDragHovered -> 2.2.dp
+                                isEditingFolder -> 1.8.dp
+                                isWorkspaceEditMode -> 1.3.dp
+                                else -> 0.8.dp
+                            },
+                            color = when {
+                                isDragHovered -> MiuiFolderDragHighlightBlue
+                                isEditingFolder -> Color.White.copy(alpha = 0.92f)
+                                isWorkspaceEditMode -> Color.White.copy(alpha = 0.50f)
+                                else -> Color.White.copy(alpha = 0.22f)
+                            },
+                            shape = folderCornerShape
                         )
                         .miuiIconTapLongPressAndDrag(
                             key1 = folder.id,
@@ -275,6 +501,9 @@ fun HyperFolderCard(
                             onLongPressReached = {
                                 onEnterEditMode(folder)
                             },
+                            onReleaseWithoutDrag = {
+                                onReleaseFingerHold()
+                            },
                             onDragStart = { fingerRootOffset ->
                                 onStartDragFolder(folder, fingerRootOffset)
                             },
@@ -289,6 +518,14 @@ fun HyperFolderCard(
                             }
                         )
                 ) {
+                    if (mtzFolderBgBitmap != null) {
+                        Image(
+                            bitmap = mtzFolderBgBitmap,
+                            contentDescription = null,
+                            contentScale = ContentScale.FillBounds,
+                            modifier = Modifier.fillMaxSize()
+                        )
+                    }
                     Box(
                         contentAlignment = Alignment.Center,
                         modifier = Modifier
@@ -315,6 +552,7 @@ fun HyperFolderCard(
                                         DirectFolderIconOnlySlot(
                                             app = slot0,
                                             iconSize = slot2x2Size,
+                                            animRestartKey = animRestartKey,
                                             onBoundsChanged = { rect ->
                                                 if (slot0 != null) slotBoundsMap[slot0.packageName] = rect
                                             }
@@ -322,6 +560,7 @@ fun HyperFolderCard(
                                         DirectFolderIconOnlySlot(
                                             app = slot1,
                                             iconSize = slot2x2Size,
+                                            animRestartKey = animRestartKey,
                                             onBoundsChanged = { rect ->
                                                 if (slot1 != null) slotBoundsMap[slot1.packageName] = rect
                                             }
@@ -335,6 +574,7 @@ fun HyperFolderCard(
                                         DirectFolderIconOnlySlot(
                                             app = slot2,
                                             iconSize = slot2x2Size,
+                                            animRestartKey = animRestartKey,
                                             onBoundsChanged = { rect ->
                                                 if (slot2 != null) slotBoundsMap[slot2.packageName] = rect
                                             }
@@ -344,6 +584,7 @@ fun HyperFolderCard(
                                             DirectFolderIconOnlySlot(
                                                 app = slot3,
                                                 iconSize = slot2x2Size,
+                                                animRestartKey = animRestartKey,
                                                 onBoundsChanged = { rect ->
                                                     slotBoundsMap[slot3.packageName] = rect
                                                 }
@@ -372,6 +613,7 @@ fun HyperFolderCard(
                                     DirectFolderIconOnlySlot(
                                         app = slot0,
                                         iconSize = slot2x1Size,
+                                        animRestartKey = animRestartKey,
                                         onBoundsChanged = { rect ->
                                             if (slot0 != null) slotBoundsMap[slot0.packageName] = rect
                                         }
@@ -379,6 +621,7 @@ fun HyperFolderCard(
                                     DirectFolderIconOnlySlot(
                                         app = slot1,
                                         iconSize = slot2x1Size,
+                                        animRestartKey = animRestartKey,
                                         onBoundsChanged = { rect ->
                                             if (slot1 != null) slotBoundsMap[slot1.packageName] = rect
                                         }
@@ -404,6 +647,7 @@ fun HyperFolderCard(
                                     DirectFolderIconOnlySlot(
                                         app = slot0,
                                         iconSize = slot1x2Size,
+                                        animRestartKey = animRestartKey,
                                         onBoundsChanged = { rect ->
                                             if (slot0 != null) slotBoundsMap[slot0.packageName] = rect
                                         }
@@ -411,6 +655,7 @@ fun HyperFolderCard(
                                     DirectFolderIconOnlySlot(
                                         app = slot1,
                                         iconSize = slot1x2Size,
+                                        animRestartKey = animRestartKey,
                                         onBoundsChanged = { rect ->
                                             if (slot1 != null) slotBoundsMap[slot1.packageName] = rect
                                         }
@@ -441,6 +686,7 @@ fun HyperFolderCard(
                                                     DirectFolderIconOnlySlot(
                                                         app = app,
                                                         iconSize = slot3x3Size,
+                                                        animRestartKey = animRestartKey,
                                                         onBoundsChanged = { rect ->
                                                             if (app != null) slotBoundsMap[app.packageName] = rect
                                                         }
@@ -466,6 +712,14 @@ fun HyperFolderCard(
                                 )
                             }
                         }
+                    }
+                    if (mtzFolderCoverBitmap != null) {
+                        Image(
+                            bitmap = mtzFolderCoverBitmap,
+                            contentDescription = null,
+                            contentScale = ContentScale.FillBounds,
+                            modifier = Modifier.fillMaxSize()
+                        )
                     }
                 }
 
@@ -695,6 +949,7 @@ private fun MiuiPopupActionButton(
 private fun DirectFolderIconOnlySlot(
     app: InstalledAppItem?,
     iconSize: Dp,
+    animRestartKey: Any = 0,
     onBoundsChanged: (Rect) -> Unit = {}
 ) {
     if (app == null) {
@@ -705,8 +960,33 @@ private fun DirectFolderIconOnlySlot(
                 .background(Color.White.copy(alpha = 0.08f))
         )
     } else {
-        val iconBitmap = remember(app.renderKey, app.themedIconBitmap) {
-            app.themedIconBitmap.asImageBitmap()
+        val mamlSpec = app.mamlFancySpec
+        var liveBitmap by remember(app.renderKey, app.themedIconBitmap) {
+            mutableStateOf(app.themedIconBitmap)
+        }
+        if (mamlSpec != null && mamlSpec.variables.isNotEmpty()) {
+            LaunchedEffect(app.renderKey, mamlSpec.targetPackage, animRestartKey) {
+                val startMs = withFrameMillis { it }
+                val durationMs = 1050L
+                while (true) {
+                    val nowMs = withFrameMillis { it }
+                    val elapsed = (nowMs - startMs).coerceAtLeast(0L)
+                    val cal = java.util.Calendar.getInstance()
+                    val frameBmp = sharedFolderMamlEngine.renderMamlFancyIcon(
+                        spec = mamlSpec,
+                        calendar = cal,
+                        animTimeMs = elapsed.coerceAtMost(1200L)
+                    )
+                    if (frameBmp != null) {
+                        liveBitmap = frameBmp
+                    }
+                    if (elapsed >= durationMs) break
+                    delay(16L)
+                }
+            }
+        }
+        val iconBitmap = remember(liveBitmap) {
+            liveBitmap.asImageBitmap()
         }
         Image(
             bitmap = iconBitmap,
@@ -801,6 +1081,10 @@ fun HyperWorkspaceWidgetCard(
     onRefreshTelemetry: () -> Unit,
     onRemoveWidget: (String) -> Unit,
     onLaunchApp: (InstalledAppItem) -> Unit,
+    onLaunchClockApp: () -> Unit = {},
+    onLaunchCalendarApp: (Long) -> Unit = {},
+    onLaunchWeatherApp: () -> Unit = {},
+    onRequestWidgetPermissions: () -> Unit = {},
     isEditingWidget: Boolean = false,
     isWorkspaceEditMode: Boolean = false,
     onEnterEditMode: (WorkspaceWidgetItem) -> Unit = {},
@@ -809,6 +1093,7 @@ fun HyperWorkspaceWidgetCard(
     onDragWidget: (Offset) -> Unit = {},
     onEndDragWidget: (WorkspaceWidgetItem, Offset) -> Unit = { _, _ -> },
     onCancelDragWidget: () -> Unit = {},
+    onReleaseFingerHold: () -> Unit = {},
     onResizeWidgetSpan: (Int, Int) -> Unit = { _, _ -> },
     modifier: Modifier = Modifier
 ) {
@@ -818,84 +1103,920 @@ fun HyperWorkspaceWidgetCard(
     val maxRows = 4.coerceAtMost(engineConfig.gridRows.coerceIn(6, 8))
     val minSpanX = if (widget.widgetType == HyperWidgetType.NATIVE_APPWIDGET) 1 else 2
 
+    val useMtzWidgetStyle = engineConfig.enableMtzWidgetStyling && activeTheme != null
+
+    val themeAccentColor = remember(activeTheme?.titleColorHex, activeTheme?.filterWhiteColorHex, useMtzWidgetStyle) {
+        if (!useMtzWidgetStyle) {
+            Color(0xFF38BDF8)
+        } else {
+            try {
+                val hex = activeTheme?.titleColorHex ?: "#38BDF8"
+                val parsed = Color(android.graphics.Color.parseColor(hex))
+                if (parsed == Color.White) {
+                    val whiteHex = activeTheme?.filterWhiteColorHex ?: "#38BDF8"
+                    val alt = Color(android.graphics.Color.parseColor(whiteHex))
+                    if (alt == Color.White) Color(0xFF38BDF8) else alt
+                } else {
+                    parsed
+                }
+            } catch (_: Exception) {
+                Color(0xFF38BDF8)
+            }
+        }
+    }
+
+    val themePrimarySurfaceColor = remember(activeTheme?.filterBlackColorHex, useMtzWidgetStyle) {
+        if (!useMtzWidgetStyle) {
+            Color(0xFF10243E)
+        } else {
+            runCatching {
+                Color(android.graphics.Color.parseColor(activeTheme?.filterBlackColorHex ?: "#10243E"))
+            }.getOrDefault(Color(0xFF10243E))
+        }
+    }
+
+    val themeSecondarySurfaceColor = remember(activeTheme?.filterWhiteColorHex, useMtzWidgetStyle) {
+        if (!useMtzWidgetStyle) {
+            Color(0xFF1E3B58)
+        } else {
+            runCatching {
+                Color(android.graphics.Color.parseColor(activeTheme?.filterWhiteColorHex ?: "#1E3B58"))
+            }.getOrDefault(Color(0xFF1E3B58))
+        }
+    }
+
+    val mtzCustomFontFamily = remember(activeTheme?.customFontPath, useMtzWidgetStyle) {
+        if (!useMtzWidgetStyle) {
+            null
+        } else {
+            activeTheme?.customFontPath?.let { path ->
+                runCatching {
+                    val tf = android.graphics.Typeface.createFromFile(path)
+                    androidx.compose.ui.text.font.FontFamily(tf)
+                }.getOrNull()
+            }
+        }
+    }
+
+    val mtzWidgetBgBitmap = remember(activeTheme?.widgetBackgroundPath, useMtzWidgetStyle) {
+        if (!useMtzWidgetStyle) {
+            null
+        } else {
+            activeTheme?.widgetBackgroundPath?.let { path ->
+                runCatching { android.graphics.BitmapFactory.decodeFile(path)?.asImageBitmap() }.getOrNull()
+            }
+        }
+    }
+
+    val mtzGadgetCircleBitmap = remember(activeTheme?.widgetGadgetCirclePath, useMtzWidgetStyle) {
+        if (!useMtzWidgetStyle) {
+            null
+        } else {
+            activeTheme?.widgetGadgetCirclePath?.let { path ->
+                runCatching { android.graphics.BitmapFactory.decodeFile(path)?.asImageBitmap() }.getOrNull()
+            }
+        }
+    }
+
+    val mtzGadgetIconBitmap = remember(activeTheme?.widgetGadgetIconPath, useMtzWidgetStyle) {
+        if (!useMtzWidgetStyle) {
+            null
+        } else {
+            activeTheme?.widgetGadgetIconPath?.let { path ->
+                runCatching { android.graphics.BitmapFactory.decodeFile(path)?.asImageBitmap() }.getOrNull()
+            }
+        }
+    }
+
+    val mtzWeatherIconBitmap = remember(
+        activeTheme?.widgetWeatherIconPaths,
+        telemetry.weatherCondition,
+        useMtzWidgetStyle
+    ) {
+        if (!useMtzWidgetStyle) {
+            null
+        } else {
+            val map = activeTheme?.widgetWeatherIconPaths.orEmpty()
+            val condLower = telemetry.weatherCondition.lowercase()
+            val matchedPath = when {
+                condLower.contains("rain") || condLower.contains("storm") -> map["rain"]
+                condLower.contains("cloud") || condLower.contains("overcast") -> map["cloudy"]
+                condLower.contains("snow") -> map["snow"]
+                condLower.contains("night") -> map["night"]
+                else -> map["sunny"]
+            } ?: map["default"] ?: map.values.firstOrNull()
+            matchedPath?.let { path ->
+                runCatching { android.graphics.BitmapFactory.decodeFile(path)?.asImageBitmap() }.getOrNull()
+            }
+        }
+    }
+
+    val mtzDigitSprites = remember(activeTheme?.widgetDigitSpritePaths, useMtzWidgetStyle) {
+        if (!useMtzWidgetStyle) {
+            emptyMap()
+        } else {
+            val rawMap = activeTheme?.widgetDigitSpritePaths.orEmpty()
+            buildMap {
+                for ((ch, path) in rawMap) {
+                    runCatching {
+                        android.graphics.BitmapFactory.decodeFile(path)?.asImageBitmap()?.let { put(ch, it) }
+                    }
+                }
+            }
+        }
+    }
+
+    val activeMamlClockSpec = remember(
+        activeTheme?.clock2x4WidgetSpec,
+        activeTheme?.clock3x4WidgetSpec,
+        widget.spanY,
+        widget.widgetType,
+        useMtzWidgetStyle
+    ) {
+        if (!useMtzWidgetStyle) {
+            null
+        } else if (
+            widget.widgetType != HyperWidgetType.CLOCK_MTZ_STATUS &&
+            widget.widgetType != HyperWidgetType.MIUI_CLOCK_WEATHER_2X4
+        ) {
+            null
+        } else {
+            val preferred = if (widget.spanY >= 3) {
+                activeTheme?.clock3x4WidgetSpec ?: activeTheme?.clock2x4WidgetSpec
+            } else {
+                activeTheme?.clock2x4WidgetSpec ?: activeTheme?.clock3x4WidgetSpec
+            }
+            preferred?.takeIf { it.nodes.isNotEmpty() }
+        }
+    }
+
+    val isNativeAppWidget = widget.widgetType == HyperWidgetType.NATIVE_APPWIDGET
+    val isFramelessWidget = isNativeAppWidget ||
+        widget.widgetType == HyperWidgetType.CLOCK_MTZ_STATUS ||
+        activeMamlClockSpec != null
+    var cardBoundsInRoot by remember(widget.id) { mutableStateOf(Rect.Zero) }
+
     BoxWithConstraints(
         contentAlignment = Alignment.Center,
         modifier = modifier
             .fillMaxSize()
-            .padding(4.dp)
+            .padding(if (isNativeAppWidget) 0.dp else 4.dp)
+            .onGloballyPositioned { coords ->
+                cardBoundsInRoot = coords.boundsInRoot()
+            }
     ) {
         val cardWidthDp = maxWidth
         val cardHeightDp = maxHeight
 
-        Box(
-            modifier = Modifier
-                .fillMaxSize()
-                .clip(RoundedCornerShape(20.dp))
-                .background(SlateSurface.copy(alpha = 0.72f))
-                .border(
-                    width = if (isEditingWidget) 1.8.dp else if (isWorkspaceEditMode) 1.3.dp else 1.dp,
-                    color = if (isEditingWidget) Color.White.copy(alpha = 0.92f) else if (isWorkspaceEditMode) Color.White.copy(alpha = 0.50f) else Color.White.copy(alpha = 0.14f),
-                    shape = RoundedCornerShape(20.dp)
-                )
-                .miuiIconTapLongPressAndDrag(
-                    key1 = widget.id,
-                    key2 = widget.pageIndex,
-                    dragThreshold = 12.dp,
-                    enableImmediateDrag = isEditingWidget || isWorkspaceEditMode,
-                    onTap = {
-                        if (isEditingWidget) {
-                            onDismissEditMode()
-                        } else if (isWorkspaceEditMode) {
-                            onEnterEditMode(widget)
-                        }
-                    },
-                    onLongPressReached = {
-                        onEnterEditMode(widget)
-                    },
-                    onDragStart = { fingerRootOffset ->
-                        onStartDragWidget(widget, fingerRootOffset)
-                    },
-                    onDragMove = { fingerRootOffset, _ ->
-                        onDragWidget(fingerRootOffset)
-                    },
-                    onDragDrop = { fingerRootOffset ->
-                        onEndDragWidget(widget, fingerRootOffset)
-                    },
-                    onDragCancel = {
-                        onCancelDragWidget()
+        val boxModifier = Modifier
+            .fillMaxSize()
+            .then(
+                if (isNativeAppWidget && !isEditingWidget && !isWorkspaceEditMode) {
+                    Modifier
+                } else {
+                    Modifier.clip(RoundedCornerShape(if (isNativeAppWidget) 12.dp else 20.dp))
+                }
+            )
+            .background(
+                when {
+                    isFramelessWidget -> Brush.linearGradient(
+                        colors = listOf(Color.Transparent, Color.Transparent)
+                    )
+                    widget.widgetType == HyperWidgetType.MIUI_CLOCK_WEATHER_2X4 ||
+                        widget.widgetType == HyperWidgetType.MIUI_WEATHER_BRIDGE -> if (useMtzWidgetStyle) {
+                        Brush.linearGradient(
+                            colors = listOf(
+                                themePrimarySurfaceColor.copy(alpha = 0.86f),
+                                themeSecondarySurfaceColor.copy(alpha = 0.42f)
+                            )
+                        )
+                    } else {
+                        Brush.linearGradient(
+                            colors = listOf(
+                                Color(0xFF10243E).copy(alpha = 0.86f),
+                                Color(0xFF1E3B58).copy(alpha = 0.78f)
+                            )
+                        )
                     }
-                )
-                .testTag("workspace_widget_${widget.id}")
+                    widget.widgetType == HyperWidgetType.MIUI_CALENDAR_BRIDGE -> if (useMtzWidgetStyle) {
+                        Brush.linearGradient(
+                            colors = listOf(
+                                themePrimarySurfaceColor.copy(alpha = 0.88f),
+                                SlateSurface.copy(alpha = 0.84f)
+                            )
+                        )
+                    } else {
+                        Brush.linearGradient(
+                            colors = listOf(
+                                Color(0xFF1A2230).copy(alpha = 0.88f),
+                                Color(0xFF121822).copy(alpha = 0.84f)
+                            )
+                        )
+                    }
+                    else -> if (useMtzWidgetStyle) {
+                        Brush.linearGradient(
+                            colors = listOf(
+                                themePrimarySurfaceColor.copy(alpha = 0.76f),
+                                SlateSurface.copy(alpha = 0.76f)
+                            )
+                        )
+                    } else {
+                        Brush.linearGradient(
+                            colors = listOf(
+                                SlateSurface.copy(alpha = 0.72f),
+                                SlateSurface.copy(alpha = 0.72f)
+                            )
+                        )
+                    }
+                }
+            )
+            .then(
+                when {
+                    isEditingWidget -> Modifier.border(
+                        width = 1.8.dp,
+                        color = MiuiResizeHandleBlue,
+                        shape = RoundedCornerShape(if (isNativeAppWidget) 12.dp else 20.dp)
+                    )
+                    isWorkspaceEditMode -> Modifier.border(
+                        width = 1.3.dp,
+                        color = Color.White.copy(alpha = 0.50f),
+                        shape = RoundedCornerShape(if (isNativeAppWidget) 12.dp else 20.dp)
+                    )
+                    isFramelessWidget -> Modifier
+                    useMtzWidgetStyle -> Modifier.border(
+                        width = 1.2.dp,
+                        color = themeAccentColor.copy(alpha = 0.48f),
+                        shape = RoundedCornerShape(20.dp)
+                    )
+                    else -> Modifier.border(
+                        width = 1.dp,
+                        color = Color.White.copy(alpha = 0.16f),
+                        shape = RoundedCornerShape(20.dp)
+                    )
+                }
+            )
+            .miuiIconTapLongPressAndDrag(
+                key1 = widget.id,
+                key2 = widget.pageIndex,
+                dragThreshold = 12.dp,
+                enableImmediateDrag = isEditingWidget || isWorkspaceEditMode,
+                onTap = {
+                    if (isEditingWidget) {
+                        onDismissEditMode()
+                    } else if (isWorkspaceEditMode) {
+                        onEnterEditMode(widget)
+                    } else {
+                        when (widget.widgetType) {
+                            HyperWidgetType.CLOCK_MTZ_STATUS -> onLaunchClockApp()
+                            HyperWidgetType.MIUI_CLOCK_WEATHER_2X4 -> onLaunchClockApp()
+                            HyperWidgetType.MIUI_WEATHER_BRIDGE -> onLaunchWeatherApp()
+                            HyperWidgetType.MIUI_CALENDAR_BRIDGE -> onLaunchCalendarApp(
+                                telemetry.upcomingCalendarEvents.firstOrNull()?.startTimeMillis ?: System.currentTimeMillis()
+                            )
+                            HyperWidgetType.MAML_LIVE_DUO -> onLaunchClockApp()
+                            else -> {}
+                        }
+                    }
+                },
+                onTapWithOffset = { tapRootOffset ->
+                    if (isEditingWidget) {
+                        onDismissEditMode()
+                    } else if (isWorkspaceEditMode) {
+                        onEnterEditMode(widget)
+                    } else {
+                        val relX = if (cardBoundsInRoot.width > 0f) {
+                            (tapRootOffset.x - cardBoundsInRoot.left) / cardBoundsInRoot.width
+                        } else {
+                            0.5f
+                        }
+                        val relY = if (cardBoundsInRoot.height > 0f) {
+                            (tapRootOffset.y - cardBoundsInRoot.top) / cardBoundsInRoot.height
+                        } else {
+                            0.5f
+                        }
+                        when (widget.widgetType) {
+                            HyperWidgetType.CLOCK_MTZ_STATUS -> {
+                                if (relY > 0.62f) {
+                                    onLaunchCalendarApp(System.currentTimeMillis())
+                                } else {
+                                    onLaunchClockApp()
+                                }
+                            }
+                            HyperWidgetType.MIUI_CLOCK_WEATHER_2X4 -> {
+                                when {
+                                    relX > 0.56f -> onLaunchWeatherApp()
+                                    relY > 0.68f -> onLaunchCalendarApp(System.currentTimeMillis())
+                                    else -> onLaunchClockApp()
+                                }
+                            }
+                            HyperWidgetType.MIUI_WEATHER_BRIDGE -> onLaunchWeatherApp()
+                            HyperWidgetType.MIUI_CALENDAR_BRIDGE -> {
+                                val events = telemetry.upcomingCalendarEvents.take(2)
+                                val targetMillis = if (events.size >= 2 && relY > 0.72f) {
+                                    events[1].startTimeMillis
+                                } else {
+                                    events.firstOrNull()?.startTimeMillis ?: System.currentTimeMillis()
+                                }
+                                onLaunchCalendarApp(targetMillis)
+                            }
+                            HyperWidgetType.MAML_LIVE_DUO -> {
+                                if (relX in 0.22f..0.52f) {
+                                    onLaunchCalendarApp(System.currentTimeMillis())
+                                } else {
+                                    onLaunchClockApp()
+                                }
+                            }
+                            else -> {}
+                        }
+                    }
+                },
+                onLongPressReached = {
+                    onEnterEditMode(widget)
+                },
+                onReleaseWithoutDrag = {
+                    onReleaseFingerHold()
+                },
+                onDragStart = { fingerRootOffset ->
+                    onStartDragWidget(widget, fingerRootOffset)
+                },
+                onDragMove = { fingerRootOffset, _ ->
+                    onDragWidget(fingerRootOffset)
+                },
+                onDragDrop = { fingerRootOffset ->
+                    onEndDragWidget(widget, fingerRootOffset)
+                },
+                onDragCancel = {
+                    onCancelDragWidget()
+                }
+            )
+            .testTag("workspace_widget_${widget.id}")
+
+        Box(
+            modifier = boxModifier
         ) {
+            if (!isFramelessWidget && mtzWidgetBgBitmap != null) {
+                Image(
+                    bitmap = mtzWidgetBgBitmap,
+                    contentDescription = null,
+                    contentScale = androidx.compose.ui.layout.ContentScale.Crop,
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .alpha(0.32f)
+                )
+            }
+
             when (widget.widgetType) {
                 HyperWidgetType.CLOCK_MTZ_STATUS -> {
-                    Column(
-                        verticalArrangement = Arrangement.Center,
+                    if (activeMamlClockSpec != null) {
+                        MamlClockWidgetCanvas(
+                            spec = activeMamlClockSpec,
+                            cardWidthDp = cardWidthDp,
+                            cardHeightDp = cardHeightDp,
+                            telemetry = telemetry,
+                            customFontPath = activeTheme?.customFontPath,
+                            widgetId = widget.id
+                        )
+                    } else {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .padding(horizontal = 16.dp, vertical = 6.dp)
+                        ) {
+                            Column(
+                                verticalArrangement = Arrangement.Center,
+                                modifier = Modifier.weight(1f)
+                            ) {
+                                if (useMtzWidgetStyle && mtzDigitSprites.size >= 5) {
+                                    Row(
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.spacedBy(2.dp)
+                                    ) {
+                                        val digitHeight = if (widget.spanY <= 1) 30.dp else 40.dp
+                                        timeString.forEach { ch ->
+                                            val sprite = mtzDigitSprites[ch]
+                                            if (sprite != null) {
+                                                Image(
+                                                    bitmap = sprite,
+                                                    contentDescription = ch.toString(),
+                                                    modifier = Modifier.height(digitHeight)
+                                                )
+                                            } else {
+                                                Text(
+                                                    text = ch.toString(),
+                                                    style = MaterialTheme.typography.displayMedium.copy(
+                                                        fontSize = if (widget.spanY <= 1) 30.sp else 42.sp,
+                                                        fontFamily = mtzCustomFontFamily
+                                                    ),
+                                                    color = Color.White,
+                                                    fontWeight = FontWeight.Light
+                                                )
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    Text(
+                                        text = timeString,
+                                        style = MaterialTheme.typography.displayMedium.copy(
+                                            fontSize = if (widget.spanY <= 1) 30.sp else 42.sp,
+                                            fontFamily = mtzCustomFontFamily
+                                        ),
+                                        color = Color.White,
+                                        fontWeight = FontWeight.Light,
+                                        maxLines = 1
+                                    )
+                                }
+                                Spacer(modifier = Modifier.height(2.dp))
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                ) {
+                                    if (mtzWeatherIconBitmap != null) {
+                                        Image(
+                                            bitmap = mtzWeatherIconBitmap,
+                                            contentDescription = telemetry.weatherCondition,
+                                            modifier = Modifier.size(18.dp)
+                                        )
+                                    }
+                                    Text(
+                                        text = "$dateString • ${telemetry.weatherTempCelsius}°C ${telemetry.weatherCondition}",
+                                        style = MaterialTheme.typography.titleSmall.copy(
+                                            fontFamily = mtzCustomFontFamily
+                                        ),
+                                        color = if (useMtzWidgetStyle) {
+                                            Color(android.graphics.Color.parseColor(activeTheme?.titleColorHex ?: "#FFFFFF")).copy(alpha = 0.92f)
+                                        } else {
+                                            Color.White.copy(alpha = 0.88f)
+                                        },
+                                        fontWeight = FontWeight.Normal,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+
+                HyperWidgetType.MIUI_CLOCK_WEATHER_2X4 -> {
+                    if (activeMamlClockSpec != null) {
+                        MamlClockWidgetCanvas(
+                            spec = activeMamlClockSpec,
+                            cardWidthDp = cardWidthDp,
+                            cardHeightDp = cardHeightDp,
+                            telemetry = telemetry,
+                            customFontPath = activeTheme?.customFontPath,
+                            widgetId = widget.id
+                        )
+                    } else {
+                        val clockApp = allApps.firstOrNull { it.packageName.contains("clock", ignoreCase = true) }
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween,
                         modifier = Modifier
                             .fillMaxSize()
-                            .padding(horizontal = 16.dp, vertical = 6.dp)
+                            .padding(horizontal = 16.dp, vertical = 10.dp)
                     ) {
-                        Text(
-                            text = timeString,
-                            style = MaterialTheme.typography.displayMedium.copy(
-                                fontSize = if (widget.spanY <= 1) 30.sp else 42.sp
-                            ),
-                            color = Color.White,
-                            fontWeight = FontWeight.Light,
-                            maxLines = 1
-                        )
-                        Spacer(modifier = Modifier.height(2.dp))
-                        Text(
-                            text = dateString,
-                            style = MaterialTheme.typography.titleSmall,
-                            color = Color.White.copy(alpha = 0.85f),
-                            fontWeight = FontWeight.Normal,
-                            maxLines = 1
-                        )
+                        Column(
+                            verticalArrangement = Arrangement.Center,
+                            modifier = Modifier.weight(1.15f)
+                        ) {
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                if (useMtzWidgetStyle && clockApp != null) {
+                                    Image(
+                                        bitmap = clockApp.themedIconBitmap.asImageBitmap(),
+                                        contentDescription = "MIUI Theme Clock",
+                                        modifier = Modifier
+                                            .size(30.dp)
+                                            .clip(RoundedCornerShape(8.dp))
+                                    )
+                                } else {
+                                    Icon(
+                                        imageVector = Icons.Default.AccessTime,
+                                        contentDescription = "Clock",
+                                        tint = themeAccentColor,
+                                        modifier = Modifier.size(22.dp)
+                                    )
+                                }
+                                Text(
+                                    text = if (useMtzWidgetStyle) {
+                                        activeTheme?.title?.let { "$it • 2x4" } ?: "MIUI Clock 2x4"
+                                    } else {
+                                        "MIUI Clock 2x4"
+                                    },
+                                    style = MaterialTheme.typography.labelSmall.copy(
+                                        fontFamily = mtzCustomFontFamily
+                                    ),
+                                    color = themeAccentColor,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                            }
+                            Spacer(modifier = Modifier.height(2.dp))
+                            Text(
+                                text = timeString,
+                                style = MaterialTheme.typography.displayMedium.copy(
+                                    fontSize = if (widget.spanY <= 1) 28.sp else 38.sp,
+                                    fontFamily = mtzCustomFontFamily
+                                ),
+                                color = Color.White,
+                                fontWeight = FontWeight.Light,
+                                maxLines = 1
+                            )
+                            Text(
+                                text = dateString,
+                                style = MaterialTheme.typography.labelMedium.copy(
+                                    fontFamily = mtzCustomFontFamily
+                                ),
+                                color = Color.White.copy(alpha = 0.85f),
+                                maxLines = 1
+                            )
+                        }
+
+                        Column(
+                            horizontalAlignment = Alignment.End,
+                            verticalArrangement = Arrangement.Center,
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(14.dp))
+                                .background(
+                                    if (useMtzWidgetStyle) themeAccentColor.copy(alpha = 0.14f)
+                                    else Color.White.copy(alpha = 0.10f)
+                                )
+                                .border(
+                                    width = if (useMtzWidgetStyle) 0.8.dp else 0.dp,
+                                    color = if (useMtzWidgetStyle) themeAccentColor.copy(alpha = 0.35f) else Color.Transparent,
+                                    shape = RoundedCornerShape(14.dp)
+                                )
+                                .padding(horizontal = 12.dp, vertical = 8.dp)
+                        ) {
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(4.dp)
+                            ) {
+                                if (mtzWeatherIconBitmap != null) {
+                                    Image(
+                                        bitmap = mtzWeatherIconBitmap,
+                                        contentDescription = "MTZ Weather",
+                                        modifier = Modifier.size(22.dp)
+                                    )
+                                } else {
+                                    Icon(
+                                        imageVector = Icons.Default.WbSunny,
+                                        contentDescription = "Weather",
+                                        tint = Color(0xFFFBBF24),
+                                        modifier = Modifier.size(18.dp)
+                                    )
+                                }
+                                Text(
+                                    text = "${telemetry.weatherTempCelsius}°C",
+                                    style = MaterialTheme.typography.titleMedium.copy(
+                                        fontFamily = mtzCustomFontFamily
+                                    ),
+                                    color = Color.White,
+                                    fontWeight = FontWeight.Bold
+                                )
+                            }
+                            Text(
+                                text = "${telemetry.weatherCity} • ${telemetry.weatherCondition}",
+                                style = MaterialTheme.typography.labelSmall.copy(
+                                    fontFamily = mtzCustomFontFamily
+                                ),
+                                color = Color.White.copy(alpha = 0.85f),
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                            Text(
+                                text = "H:${telemetry.weatherHighCelsius}° L:${telemetry.weatherLowCelsius}° • AQI ${telemetry.weatherAqi}",
+                                style = MaterialTheme.typography.labelSmall.copy(
+                                    fontSize = 10.sp,
+                                    fontFamily = mtzCustomFontFamily
+                                ),
+                                color = if (useMtzWidgetStyle) themeAccentColor else MintTertiary,
+                                maxLines = 1
+                            )
+                            if (!telemetry.hasLocationPermission) {
+                                Text(
+                                    text = "Tap to Grant GPS",
+                                    style = MaterialTheme.typography.labelSmall.copy(fontSize = 9.sp),
+                                    color = Color(0xFF38BDF8),
+                                    fontWeight = FontWeight.SemiBold,
+                                    modifier = Modifier
+                                        .padding(top = 2.dp)
+                                        .clickable { onRequestWidgetPermissions() }
+                                )
+                            }
+                        }
+                    }
+                    }
+                }
+
+                HyperWidgetType.MIUI_WEATHER_BRIDGE -> {
+                    val weatherApp = allApps.firstOrNull { it.packageName.contains("weather", ignoreCase = true) }
+                    Column(
+                        verticalArrangement = Arrangement.SpaceBetween,
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .padding(14.dp)
+                    ) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(6.dp)
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.LocationOn,
+                                    contentDescription = "Location",
+                                    tint = themeAccentColor,
+                                    modifier = Modifier.size(16.dp)
+                                )
+                                Text(
+                                    text = telemetry.weatherCity,
+                                    style = MaterialTheme.typography.titleSmall.copy(
+                                        fontFamily = mtzCustomFontFamily
+                                    ),
+                                    color = Color.White,
+                                    fontWeight = FontWeight.SemiBold,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                                Surface(
+                                    color = themeAccentColor.copy(alpha = 0.22f),
+                                    shape = RoundedCornerShape(6.dp)
+                                ) {
+                                    Text(
+                                        text = "AQI ${telemetry.weatherAqi}",
+                                        style = MaterialTheme.typography.labelSmall.copy(
+                                            fontSize = 10.sp,
+                                            fontFamily = mtzCustomFontFamily
+                                        ),
+                                        color = themeAccentColor,
+                                        modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                                    )
+                                }
+                            }
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(6.dp)
+                            ) {
+                                if (!telemetry.hasLocationPermission) {
+                                    Surface(
+                                        color = EmeraldPrimary.copy(alpha = 0.28f),
+                                        shape = RoundedCornerShape(8.dp),
+                                        modifier = Modifier
+                                            .clickable { onRequestWidgetPermissions() }
+                                            .testTag("widget_grant_location_${widget.id}")
+                                    ) {
+                                        Text(
+                                            text = "Grant GPS",
+                                            style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp),
+                                            color = EmeraldBright,
+                                            modifier = Modifier.padding(horizontal = 7.dp, vertical = 3.dp)
+                                        )
+                                    }
+                                }
+                                Icon(
+                                    imageVector = Icons.Default.Refresh,
+                                    contentDescription = "Refresh Weather",
+                                    tint = Color.White.copy(alpha = 0.78f),
+                                    modifier = Modifier
+                                        .size(16.dp)
+                                        .clickable(onClick = onRefreshTelemetry)
+                                )
+                            }
+                        }
+
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.Bottom
+                        ) {
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(10.dp)
+                            ) {
+                                when {
+                                    mtzWeatherIconBitmap != null -> {
+                                        Image(
+                                            bitmap = mtzWeatherIconBitmap,
+                                            contentDescription = telemetry.weatherCondition,
+                                            modifier = Modifier.size(38.dp)
+                                        )
+                                    }
+                                    useMtzWidgetStyle && weatherApp != null -> {
+                                        Image(
+                                            bitmap = weatherApp.themedIconBitmap.asImageBitmap(),
+                                            contentDescription = telemetry.weatherCondition,
+                                            modifier = Modifier
+                                                .size(36.dp)
+                                                .clip(RoundedCornerShape(8.dp))
+                                        )
+                                    }
+                                    else -> {
+                                        Icon(
+                                            imageVector = Icons.Default.WbSunny,
+                                            contentDescription = telemetry.weatherCondition,
+                                            tint = Color(0xFFFBBF24),
+                                            modifier = Modifier.size(36.dp)
+                                        )
+                                    }
+                                }
+                                Column {
+                                    Text(
+                                        text = "${telemetry.weatherTempCelsius}°C",
+                                        style = MaterialTheme.typography.headlineMedium.copy(
+                                            fontWeight = FontWeight.Bold,
+                                            fontFamily = mtzCustomFontFamily
+                                        ),
+                                        color = Color.White
+                                    )
+                                    Text(
+                                        text = telemetry.weatherCondition,
+                                        style = MaterialTheme.typography.labelSmall.copy(
+                                            fontFamily = mtzCustomFontFamily
+                                        ),
+                                        color = Color.White.copy(alpha = 0.85f)
+                                    )
+                                }
+                            }
+                            Column(horizontalAlignment = Alignment.End) {
+                                Text(
+                                    text = "H:${telemetry.weatherHighCelsius}°  L:${telemetry.weatherLowCelsius}°",
+                                    style = MaterialTheme.typography.labelMedium.copy(
+                                        fontFamily = mtzCustomFontFamily
+                                    ),
+                                    color = Color.White,
+                                    fontWeight = FontWeight.Medium
+                                )
+                                Text(
+                                    text = "Humidity ${telemetry.weatherHumidity}% • Wind ${telemetry.weatherWindKmh} km/h",
+                                    style = MaterialTheme.typography.labelSmall.copy(
+                                        fontSize = 10.sp,
+                                        fontFamily = mtzCustomFontFamily
+                                    ),
+                                    color = Color.White.copy(alpha = 0.75f)
+                                )
+                            }
+                        }
+                    }
+                }
+
+                HyperWidgetType.MIUI_CALENDAR_BRIDGE -> {
+                    val calApp = allApps.firstOrNull { it.packageName.contains("calendar", ignoreCase = true) }
+                    val timeFmt = remember { SimpleDateFormat("HH:mm", Locale.getDefault()) }
+                    Column(
+                        verticalArrangement = Arrangement.SpaceBetween,
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .padding(12.dp)
+                    ) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                if (useMtzWidgetStyle && calApp != null) {
+                                    Image(
+                                        bitmap = calApp.themedIconBitmap.asImageBitmap(),
+                                        contentDescription = "MIUI Calendar",
+                                        modifier = Modifier
+                                            .size(28.dp)
+                                            .clip(RoundedCornerShape(7.dp))
+                                    )
+                                } else {
+                                    Icon(
+                                        imageVector = Icons.Default.CalendarMonth,
+                                        contentDescription = "Calendar",
+                                        tint = if (useMtzWidgetStyle) themeAccentColor else EmeraldBright,
+                                        modifier = Modifier.size(20.dp)
+                                    )
+                                }
+                                Column {
+                                    Text(
+                                        text = dateString,
+                                        style = MaterialTheme.typography.titleSmall.copy(
+                                            fontFamily = mtzCustomFontFamily
+                                        ),
+                                        color = Color.White,
+                                        fontWeight = FontWeight.SemiBold
+                                    )
+                                    Text(
+                                        text = if (useMtzWidgetStyle && activeTheme != null) {
+                                            "${activeTheme.title} • Calendar Bridge"
+                                        } else {
+                                            "MIUI Theme Calendar Bridge"
+                                        },
+                                        style = MaterialTheme.typography.labelSmall.copy(
+                                            fontSize = 10.sp,
+                                            fontFamily = mtzCustomFontFamily
+                                        ),
+                                        color = if (useMtzWidgetStyle) themeAccentColor else TextSecondary
+                                    )
+                                }
+                            }
+                            if (!telemetry.hasCalendarPermission) {
+                                Surface(
+                                    color = EmeraldPrimary.copy(alpha = 0.28f),
+                                    shape = RoundedCornerShape(8.dp),
+                                    modifier = Modifier
+                                        .clickable { onRequestWidgetPermissions() }
+                                        .testTag("widget_grant_calendar_${widget.id}")
+                                ) {
+                                    Text(
+                                        text = "Grant Calendar",
+                                        style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp),
+                                        color = EmeraldBright,
+                                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                                    )
+                                }
+                            } else {
+                                Icon(
+                                    imageVector = Icons.Default.Refresh,
+                                    contentDescription = "Refresh Calendar",
+                                    tint = TextSecondary,
+                                    modifier = Modifier
+                                        .size(16.dp)
+                                        .clickable(onClick = onRefreshTelemetry)
+                                )
+                            }
+                        }
+
+                        if (telemetry.upcomingCalendarEvents.isNotEmpty()) {
+                            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                                telemetry.upcomingCalendarEvents.take(2).forEach { ev ->
+                                    Row(
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.SpaceBetween,
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .clip(RoundedCornerShape(8.dp))
+                                            .background(Color.White.copy(alpha = 0.08f))
+                                            .padding(horizontal = 8.dp, vertical = 5.dp)
+                                    ) {
+                                        Text(
+                                            text = ev.title,
+                                            style = MaterialTheme.typography.labelMedium.copy(
+                                                fontFamily = mtzCustomFontFamily
+                                            ),
+                                            color = Color.White,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis,
+                                            modifier = Modifier.weight(1f)
+                                        )
+                                        Spacer(modifier = Modifier.width(8.dp))
+                                        Text(
+                                            text = if (ev.isAllDay) "All day" else timeFmt.format(Date(ev.startTimeMillis)),
+                                            style = MaterialTheme.typography.labelSmall.copy(
+                                                fontFamily = mtzCustomFontFamily
+                                            ),
+                                            color = if (useMtzWidgetStyle) themeAccentColor else EmeraldBright
+                                        )
+                                    }
+                                }
+                            }
+                        } else {
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clip(RoundedCornerShape(10.dp))
+                                    .background(Color.White.copy(alpha = 0.07f))
+                                    .padding(horizontal = 10.dp, vertical = 8.dp)
+                            ) {
+                                Text(
+                                    text = if (telemetry.hasCalendarPermission) {
+                                        "No upcoming events • Tap to open Calendar"
+                                    } else {
+                                        "Tap to open native Calendar or grant READ_CALENDAR"
+                                    },
+                                    style = MaterialTheme.typography.labelSmall.copy(
+                                        fontFamily = mtzCustomFontFamily
+                                    ),
+                                    color = Color.White.copy(alpha = 0.85f),
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                            }
+                        }
                     }
                 }
 
             HyperWidgetType.DEVICE_TELEMETRY -> {
+                val primaryBarColor = if (useMtzWidgetStyle) themeAccentColor else EmeraldPrimary
+                val secondaryBarColor = if (useMtzWidgetStyle) themeSecondarySurfaceColor else MintTertiary
+                val titleAccentColor = if (useMtzWidgetStyle) themeAccentColor else EmeraldBright
                 Column(modifier = Modifier.padding(12.dp)) {
                     Row(
                         modifier = Modifier.fillMaxWidth(),
@@ -903,17 +2024,42 @@ fun HyperWorkspaceWidgetCard(
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Row(verticalAlignment = Alignment.CenterVertically) {
-                            Icon(
-                                imageVector = Icons.Default.BatteryChargingFull,
-                                contentDescription = "Battery",
-                                tint = EmeraldBright,
-                                modifier = Modifier.size(16.dp)
-                            )
-                            Spacer(modifier = Modifier.width(4.dp))
+                            if (mtzGadgetIconBitmap != null || mtzGadgetCircleBitmap != null) {
+                                Box(
+                                    contentAlignment = Alignment.Center,
+                                    modifier = Modifier.size(20.dp)
+                                ) {
+                                    if (mtzGadgetCircleBitmap != null) {
+                                        Image(
+                                            bitmap = mtzGadgetCircleBitmap,
+                                            contentDescription = null,
+                                            contentScale = ContentScale.Fit,
+                                            modifier = Modifier.fillMaxSize()
+                                        )
+                                    }
+                                    if (mtzGadgetIconBitmap != null) {
+                                        Image(
+                                            bitmap = mtzGadgetIconBitmap,
+                                            contentDescription = "Gadget Status",
+                                            contentScale = ContentScale.Fit,
+                                            modifier = Modifier.size(16.dp)
+                                        )
+                                    }
+                                }
+                            } else {
+                                Icon(
+                                    imageVector = Icons.Default.BatteryChargingFull,
+                                    contentDescription = "Battery",
+                                    tint = titleAccentColor,
+                                    modifier = Modifier.size(16.dp)
+                                )
+                            }
+                            Spacer(modifier = Modifier.width(6.dp))
                             Text(
                                 text = "System Status",
                                 style = MaterialTheme.typography.labelLarge,
-                                color = EmeraldBright
+                                fontFamily = mtzCustomFontFamily ?: FontFamily.Default,
+                                color = titleAccentColor
                             )
                         }
                         Row {
@@ -951,13 +2097,14 @@ fun HyperWorkspaceWidgetCard(
                         Text(
                             text = "${telemetry.batteryPercent}% (${String.format(Locale.US, "%.1f", telemetry.batteryTempCelsius)}C)",
                             style = MaterialTheme.typography.labelSmall,
-                            color = EmeraldBright
+                            fontFamily = mtzCustomFontFamily ?: FontFamily.Default,
+                            color = titleAccentColor
                         )
                     }
                     Spacer(modifier = Modifier.height(4.dp))
                     LinearProgressIndicator(
                         progress = { (telemetry.batteryPercent / 100f).coerceIn(0.05f, 1f) },
-                        color = EmeraldPrimary,
+                        color = primaryBarColor,
                         trackColor = SlateSurfaceElevated,
                         modifier = Modifier
                             .fillMaxWidth()
@@ -980,13 +2127,14 @@ fun HyperWorkspaceWidgetCard(
                         Text(
                             text = "${telemetry.usedRamMb} / ${telemetry.totalRamMb} MB",
                             style = MaterialTheme.typography.labelSmall,
-                            color = MintTertiary
+                            fontFamily = mtzCustomFontFamily ?: FontFamily.Default,
+                            color = secondaryBarColor
                         )
                     }
                     Spacer(modifier = Modifier.height(4.dp))
                     LinearProgressIndicator(
                         progress = { ramRatio },
-                        color = MintTertiary,
+                        color = secondaryBarColor,
                         trackColor = SlateSurfaceElevated,
                         modifier = Modifier
                             .fillMaxWidth()
@@ -997,6 +2145,7 @@ fun HyperWorkspaceWidgetCard(
             }
 
             HyperWidgetType.STORAGE_AND_PACKS -> {
+                val storageAccentColor = if (useMtzWidgetStyle) themeAccentColor else SageSecondary
                 Column(modifier = Modifier.padding(12.dp)) {
                     Row(
                         modifier = Modifier.fillMaxWidth(),
@@ -1004,17 +2153,27 @@ fun HyperWorkspaceWidgetCard(
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Row(verticalAlignment = Alignment.CenterVertically) {
-                            Icon(
-                                imageVector = Icons.Default.Storage,
-                                contentDescription = "Storage",
-                                tint = SageSecondary,
-                                modifier = Modifier.size(16.dp)
-                            )
-                            Spacer(modifier = Modifier.width(4.dp))
+                            if (mtzGadgetCircleBitmap != null) {
+                                Image(
+                                    bitmap = mtzGadgetCircleBitmap,
+                                    contentDescription = "Storage",
+                                    contentScale = ContentScale.Fit,
+                                    modifier = Modifier.size(18.dp)
+                                )
+                            } else {
+                                Icon(
+                                    imageVector = Icons.Default.Storage,
+                                    contentDescription = "Storage",
+                                    tint = storageAccentColor,
+                                    modifier = Modifier.size(16.dp)
+                                )
+                            }
+                            Spacer(modifier = Modifier.width(6.dp))
                             Text(
                                 text = "Storage Status",
                                 style = MaterialTheme.typography.labelLarge,
-                                color = SageSecondary
+                                fontFamily = mtzCustomFontFamily ?: FontFamily.Default,
+                                color = storageAccentColor
                             )
                         }
                         Icon(
@@ -1042,13 +2201,14 @@ fun HyperWorkspaceWidgetCard(
                         Text(
                             text = String.format(Locale.US, "%.1f / %.0f GB", telemetry.usedStorageGb, telemetry.totalStorageGb),
                             style = MaterialTheme.typography.labelSmall,
-                            color = SageSecondary
+                            fontFamily = mtzCustomFontFamily ?: FontFamily.Default,
+                            color = storageAccentColor
                         )
                     }
                     Spacer(modifier = Modifier.height(4.dp))
                     LinearProgressIndicator(
                         progress = { storageRatio },
-                        color = SageSecondary,
+                        color = storageAccentColor,
                         trackColor = SlateSurfaceElevated,
                         modifier = Modifier
                             .fillMaxWidth()
@@ -1058,9 +2218,12 @@ fun HyperWorkspaceWidgetCard(
 
                     Spacer(modifier = Modifier.height(8.dp))
 
-                    val mamlCount = allApps.count { it.resolutionSource == IconResolutionSource.MTZ_FANCY_MAML }
-                    val directCount = allApps.count { it.resolutionSource == IconResolutionSource.MTZ_DIRECT_MAP }
-                    val ruleCount = allApps.count { it.resolutionSource == IconResolutionSource.MTZ_RULE_MAP }
+                    val mamlCount = activeTheme?.fancyIconSpecs?.size
+                        ?: allApps.count { it.resolutionSource == IconResolutionSource.MTZ_FANCY_MAML }
+                    val directCount = activeTheme?.directIconsMap?.size
+                        ?: allApps.count { it.resolutionSource == IconResolutionSource.MTZ_DIRECT_MAP }
+                    val ruleCount = activeTheme?.iconRulesMap?.size
+                        ?: allApps.count { it.resolutionSource == IconResolutionSource.MTZ_RULE_MAP }
                     val maskCount = allApps.count { it.resolutionSource == IconResolutionSource.MTZ_DYNAMIC_MASK }
 
                     Text(
@@ -1074,6 +2237,50 @@ fun HyperWorkspaceWidgetCard(
             }
 
             HyperWidgetType.MAML_LIVE_DUO -> {
+                val clockFancyBmp = remember(activeTheme, useMtzWidgetStyle, timeString) {
+                    if (!useMtzWidgetStyle || activeTheme == null) null
+                    else activeTheme.fancyIconSpecs.entries.firstOrNull { (k, _) ->
+                        k.contains("deskclock", ignoreCase = true) || k.contains("clock", ignoreCase = true)
+                    }?.value?.let { spec ->
+                        runCatching {
+                            sharedFolderMamlEngine.renderMamlFancyIcon(
+                                spec = spec,
+                                calendar = java.util.Calendar.getInstance(),
+                                animTimeMs = 0L
+                            )?.asImageBitmap()
+                        }.getOrNull()
+                    }
+                }
+                val calFancyBmp = remember(activeTheme, useMtzWidgetStyle, dateString) {
+                    if (!useMtzWidgetStyle || activeTheme == null) null
+                    else activeTheme.fancyIconSpecs.entries.firstOrNull { (k, _) ->
+                        k.contains("calendar", ignoreCase = true)
+                    }?.value?.let { spec ->
+                        runCatching {
+                            sharedFolderMamlEngine.renderMamlFancyIcon(
+                                spec = spec,
+                                calendar = java.util.Calendar.getInstance(),
+                                animTimeMs = 0L
+                            )?.asImageBitmap()
+                        }.getOrNull()
+                    }
+                }
+                val clockDirectBmp = remember(activeTheme, useMtzWidgetStyle) {
+                    if (!useMtzWidgetStyle || activeTheme == null) null
+                    else activeTheme.directIconsMap.entries.firstOrNull { (k, _) ->
+                        k.contains("deskclock", ignoreCase = true)
+                    }?.value?.let { path ->
+                        runCatching { android.graphics.BitmapFactory.decodeFile(path)?.asImageBitmap() }.getOrNull()
+                    }
+                }
+                val calDirectBmp = remember(activeTheme, useMtzWidgetStyle) {
+                    if (!useMtzWidgetStyle || activeTheme == null) null
+                    else activeTheme.directIconsMap.entries.firstOrNull { (k, _) ->
+                        k.contains("calendar", ignoreCase = true)
+                    }?.value?.let { path ->
+                        runCatching { android.graphics.BitmapFactory.decodeFile(path)?.asImageBitmap() }.getOrNull()
+                    }
+                }
                 val clockApp = allApps.firstOrNull { it.packageName.contains("deskclock") }
                 val calApp = allApps.firstOrNull { it.packageName.contains("calendar") }
 
@@ -1089,34 +2296,35 @@ fun HyperWorkspaceWidgetCard(
                         horizontalArrangement = Arrangement.spacedBy(12.dp),
                         modifier = Modifier.weight(1f)
                     ) {
-                        if (clockApp != null) {
+                        val effectiveClockBmp = clockFancyBmp ?: clockDirectBmp ?: clockApp?.themedIconBitmap?.asImageBitmap()
+                        val effectiveCalBmp = calFancyBmp ?: calDirectBmp ?: calApp?.themedIconBitmap?.asImageBitmap()
+                        if (effectiveClockBmp != null) {
                             Image(
-                                bitmap = clockApp.themedIconBitmap.asImageBitmap(),
+                                bitmap = effectiveClockBmp,
                                 contentDescription = "MAML Clock",
-                                modifier = Modifier
-                                    .size(48.dp)
-                                    .clickable { onLaunchApp(clockApp) }
+                                modifier = Modifier.size(48.dp)
                             )
                         }
-                        if (calApp != null) {
+                        if (effectiveCalBmp != null) {
                             Image(
-                                bitmap = calApp.themedIconBitmap.asImageBitmap(),
+                                bitmap = effectiveCalBmp,
                                 contentDescription = "MAML Calendar",
-                                modifier = Modifier
-                                    .size(48.dp)
-                                    .clickable { onLaunchApp(calApp) }
+                                modifier = Modifier.size(48.dp)
                             )
                         }
                         Column {
                             Text(
                                 text = "Clock & Calendar",
                                 style = MaterialTheme.typography.titleSmall,
-                                color = Color.White
+                                fontFamily = mtzCustomFontFamily ?: FontFamily.Default,
+                                color = if (useMtzWidgetStyle) themeAccentColor else Color.White
                             )
                             Text(
-                                text = "Live MAML Dynamic Icons",
+                                text = activeTheme?.title?.let { "MAML: $it" } ?: "Live MAML Dynamic Icons",
                                 style = MaterialTheme.typography.labelSmall,
-                                color = TextSecondary
+                                color = TextSecondary,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
                             )
                         }
                     }
@@ -1134,58 +2342,72 @@ fun HyperWorkspaceWidgetCard(
 
             HyperWidgetType.NATIVE_APPWIDGET -> {
                 val context = LocalContext.current
-                Column(modifier = Modifier.padding(12.dp)) {
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Text(
-                            text = widget.customTitle,
-                            style = MaterialTheme.typography.labelLarge,
-                            color = EmeraldBright
-                        )
-                        Icon(
-                            imageVector = Icons.Default.Close,
-                            contentDescription = "Remove Native Widget",
-                            tint = TextMuted,
-                            modifier = Modifier
-                                .size(16.dp)
-                                .clickable { onRemoveWidget(widget.id) }
-                        )
+                val providerComp = widget.providerComponent?.let { ComponentName.unflattenFromString(it) }
+                val appWidgetManager = remember { AppWidgetManager.getInstance(context) }
+                val providerInfo = remember(widget.appWidgetId, providerComp) {
+                    if (widget.appWidgetId >= 0) {
+                        appWidgetManager.getAppWidgetInfo(widget.appWidgetId)
+                            ?: appWidgetManager.installedProviders.firstOrNull { it.provider == providerComp }
+                    } else {
+                        appWidgetManager.installedProviders.firstOrNull { it.provider == providerComp }
                     }
-                    Spacer(modifier = Modifier.height(6.dp))
-                    val providerComp = widget.providerComponent?.let { ComponentName.unflattenFromString(it) }
-                    val appWidgetManager = remember { AppWidgetManager.getInstance(context) }
-                    val providerInfo = remember(widget.appWidgetId, providerComp) {
-                        if (widget.appWidgetId >= 0) {
-                            appWidgetManager.getAppWidgetInfo(widget.appWidgetId)
-                        } else {
-                            appWidgetManager.installedProviders.firstOrNull { it.provider == providerComp }
+                }
+                val hostApp = remember(providerComp, allApps) {
+                    val pkg = providerComp?.packageName
+                    allApps.firstOrNull { it.packageName == pkg }
+                }
+
+                val bindHostCallbacks: (LauncherAppWidgetHostView) -> Unit = { hostView ->
+                    hostView.setPadding(0, 0, 0, 0)
+                    hostView.isEditModeActive = isEditingWidget || isWorkspaceEditMode
+                    hostView.onTapInEditModeListener = {
+                        if (isEditingWidget) {
+                            onDismissEditMode()
+                        } else if (isWorkspaceEditMode) {
+                            onEnterEditMode(widget)
                         }
                     }
+                    hostView.onLongPressListener = {
+                        onEnterEditMode(widget)
+                    }
+                    hostView.onReleaseWithoutDragListener = {
+                        onReleaseFingerHold()
+                    }
+                    hostView.onStartDragListener = { localX, localY ->
+                        onStartDragWidget(
+                            widget,
+                            Offset(cardBoundsInRoot.left + localX, cardBoundsInRoot.top + localY)
+                        )
+                    }
+                    hostView.onDragMoveListener = { localX, localY ->
+                        onDragWidget(
+                            Offset(cardBoundsInRoot.left + localX, cardBoundsInRoot.top + localY)
+                        )
+                    }
+                    hostView.onDragDropListener = { localX, localY ->
+                        onEndDragWidget(
+                            widget,
+                            Offset(cardBoundsInRoot.left + localX, cardBoundsInRoot.top + localY)
+                        )
+                    }
+                    hostView.onDragCancelListener = {
+                        onCancelDragWidget()
+                    }
+                }
 
-                    if (appWidgetHost != null && widget.appWidgetId >= 0 && providerInfo != null) {
-                        val widthDpInt = cardWidthDp.value.toInt().coerceAtLeast(100)
-                        val heightDpInt = (cardHeightDp.value.toInt() - 36).coerceAtLeast(60)
-                        AndroidView(
-                            factory = { ctx ->
-                                appWidgetHost.createView(ctx, widget.appWidgetId, providerInfo).apply {
-                                    setAppWidget(widget.appWidgetId, providerInfo)
-                                    runCatching {
-                                        updateAppWidgetSize(
-                                            android.os.Bundle(),
-                                            widthDpInt,
-                                            heightDpInt,
-                                            widthDpInt,
-                                            heightDpInt
-                                        )
-                                    }
+                if (appWidgetHost != null && widget.appWidgetId >= 0 && providerInfo != null) {
+                    val widthDpInt = cardWidthDp.value.toInt().coerceAtLeast(60)
+                    val heightDpInt = cardHeightDp.value.toInt().coerceAtLeast(60)
+                    AndroidView(
+                        factory = { ctx ->
+                            appWidgetHost.createView(ctx, widget.appWidgetId, providerInfo).apply {
+                                setPadding(0, 0, 0, 0)
+                                setAppWidget(widget.appWidgetId, providerInfo)
+                                if (this is LauncherAppWidgetHostView) {
+                                    bindHostCallbacks(this)
                                 }
-                            },
-                            update = { hostView ->
                                 runCatching {
-                                    hostView.updateAppWidgetSize(
+                                    updateAppWidgetSize(
                                         android.os.Bundle(),
                                         widthDpInt,
                                         heightDpInt,
@@ -1193,17 +2415,48 @@ fun HyperWorkspaceWidgetCard(
                                         heightDpInt
                                     )
                                 }
-                            },
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .weight(1f)
-                        )
-                    } else {
-                        Text(
-                            text = "Provider: ${widget.providerComponent ?: "System AppWidget"}",
-                            style = MaterialTheme.typography.labelSmall,
-                            color = TextSecondary
-                        )
+                            }
+                        },
+                        update = { hostView ->
+                            hostView.setPadding(0, 0, 0, 0)
+                            if (hostView is LauncherAppWidgetHostView) {
+                                bindHostCallbacks(hostView)
+                            }
+                            runCatching {
+                                hostView.updateAppWidgetSize(
+                                    android.os.Bundle(),
+                                    widthDpInt,
+                                    heightDpInt,
+                                    widthDpInt,
+                                    heightDpInt
+                                )
+                            }
+                        },
+                        modifier = Modifier.fillMaxSize()
+                    )
+                } else {
+                    // Clean frameless native shortcut fallback if widget ID was not bound yet
+                    Box(
+                        contentAlignment = Alignment.Center,
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .clickable(enabled = !isEditingWidget && !isWorkspaceEditMode) {
+                                val pkg = providerComp?.packageName
+                                when {
+                                    pkg?.contains("clock", ignoreCase = true) == true -> onLaunchClockApp()
+                                    pkg?.contains("calendar", ignoreCase = true) == true -> onLaunchCalendarApp(System.currentTimeMillis())
+                                    pkg?.contains("weather", ignoreCase = true) == true -> onLaunchWeatherApp()
+                                    hostApp != null -> onLaunchApp(hostApp)
+                                }
+                            }
+                    ) {
+                        if (hostApp != null) {
+                            Image(
+                                bitmap = hostApp.themedIconBitmap.asImageBitmap(),
+                                contentDescription = widget.customTitle,
+                                modifier = Modifier.size(56.dp)
+                            )
+                        }
                     }
                 }
             }
@@ -1306,28 +2559,75 @@ fun ExpandedHyperFolderSheet(
     onStartDragOutOfFolder: (InstalledAppItem, Offset) -> Unit = { _, _ -> },
     onUpdateDragOutOfFolder: (Offset) -> Unit = {},
     onDropDragOutOfFolder: (InstalledAppItem, Offset) -> Unit = { _, _ -> },
-    onCancelDragOutOfFolder: () -> Unit = {}
+    onCancelDragOutOfFolder: () -> Unit = {},
+    overlayShadeAlpha: Float = 0.60f,
+    folderAnimationMode: MiuiFolderAnimationMode = MiuiFolderAnimationMode.MIUI_ZOOM_EXPAND,
+    sourceFolderBounds: Rect? = null
 ) {
+    val coroutineScope = rememberCoroutineScope()
     var showAddAppsPicker by remember { mutableStateOf(false) }
     var showRenameDialog by remember { mutableStateOf(false) }
     var titleInput by remember(folder.title) { mutableStateOf(folder.title) }
     var longPressedAppInFolder by remember { mutableStateOf<InstalledAppItem?>(null) }
     var isDraggingOutToWorkspace by remember { mutableStateOf(false) }
+    var overlayBoundsInRoot by remember { mutableStateOf(Rect.Zero) }
+
+    val openProgress = remember(folder.id, folderAnimationMode) {
+        Animatable(if (folderAnimationMode == MiuiFolderAnimationMode.OFF) 1f else 0f)
+    }
+
+    LaunchedEffect(folder.id, folderAnimationMode) {
+        if (folderAnimationMode == MiuiFolderAnimationMode.OFF) {
+            openProgress.snapTo(1f)
+        } else {
+            openProgress.animateTo(
+                targetValue = 1f,
+                animationSpec = tween(
+                    durationMillis = if (folderAnimationMode == MiuiFolderAnimationMode.MIUI_ZOOM_EXPAND) 260 else 200,
+                    easing = FastOutSlowInEasing
+                )
+            )
+        }
+    }
+
+    val triggerAnimatedDismiss: () -> Unit = {
+        if (folderAnimationMode == MiuiFolderAnimationMode.OFF) {
+            onDismiss()
+        } else {
+            coroutineScope.launch {
+                openProgress.animateTo(
+                    targetValue = 0f,
+                    animationSpec = tween(
+                        durationMillis = 190,
+                        easing = FastOutSlowInEasing
+                    )
+                )
+                onDismiss()
+            }
+        }
+    }
 
     BackHandler(onBack = {
         when {
             longPressedAppInFolder != null -> longPressedAppInFolder = null
             showAddAppsPicker -> showAddAppsPicker = false
-            else -> onDismiss()
+            else -> triggerAnimatedDismiss()
         }
     })
+
+    val animFraction = openProgress.value.coerceIn(0f, 1f)
+    val effectiveBackdropAlpha = (overlayShadeAlpha.coerceIn(0f, 0.95f) * animFraction).coerceIn(0f, 0.95f)
 
     Box(
         modifier = Modifier
             .fillMaxSize()
             .zIndex(45f)
             .alpha(if (isDraggingOutToWorkspace) 0f else 1f)
-            .background(Color.Black.copy(alpha = 0.62f))
+            .background(Color.Black.copy(alpha = effectiveBackdropAlpha))
+            .onGloballyPositioned { coords ->
+                overlayBoundsInRoot = coords.boundsInRoot()
+            }
+            .windowInsetsPadding(WindowInsets.safeDrawing)
             .clickable(
                 interactionSource = remember { MutableInteractionSource() },
                 indication = null,
@@ -1335,7 +2635,7 @@ fun ExpandedHyperFolderSheet(
                     when {
                         longPressedAppInFolder != null -> longPressedAppInFolder = null
                         showAddAppsPicker -> showAddAppsPicker = false
-                        else -> onDismiss()
+                        else -> triggerAnimatedDismiss()
                     }
                 }
             )
@@ -1346,7 +2646,38 @@ fun ExpandedHyperFolderSheet(
                 horizontalAlignment = Alignment.CenterHorizontally,
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(top = 136.dp, start = 28.dp, end = 28.dp)
+                    .graphicsLayer {
+                        when (folderAnimationMode) {
+                            MiuiFolderAnimationMode.OFF -> {
+                                alpha = 1f
+                                scaleX = 1f
+                                scaleY = 1f
+                            }
+                            MiuiFolderAnimationMode.SMOOTH_FADE -> {
+                                alpha = animFraction
+                                val s = 0.94f + 0.06f * animFraction
+                                scaleX = s
+                                scaleY = s
+                            }
+                            MiuiFolderAnimationMode.MIUI_ZOOM_EXPAND -> {
+                                alpha = animFraction
+                                val startScale = 0.28f
+                                val curScale = startScale + (1f - startScale) * animFraction
+                                scaleX = curScale
+                                scaleY = curScale
+                                val src = sourceFolderBounds
+                                if (src != null && src != Rect.Zero && overlayBoundsInRoot.width > 0f) {
+                                    val targetCenterX = overlayBoundsInRoot.center.x
+                                    val targetCenterY = overlayBoundsInRoot.top + overlayBoundsInRoot.height * 0.42f
+                                    val dx = src.center.x - targetCenterX
+                                    val dy = src.center.y - targetCenterY
+                                    translationX = dx * (1f - animFraction)
+                                    translationY = dy * (1f - animFraction)
+                                }
+                            }
+                        }
+                    }
+                    .padding(top = 112.dp, start = 28.dp, end = 28.dp)
                     .clickable(
                         interactionSource = remember { MutableInteractionSource() },
                         indication = null,
@@ -1869,7 +3200,7 @@ fun WidgetsAndFoldersPickerSheet(
 
             item {
                 Text(
-                    text = "System & Clock Widgets",
+                    text = "MIUI Theme & Native Bridge Widgets",
                     style = MaterialTheme.typography.titleMedium,
                     color = TextPrimary
                 )
@@ -1877,6 +3208,9 @@ fun WidgetsAndFoldersPickerSheet(
 
             val builtInTypes = listOf(
                 HyperWidgetType.CLOCK_MTZ_STATUS,
+                HyperWidgetType.MIUI_CLOCK_WEATHER_2X4,
+                HyperWidgetType.MIUI_WEATHER_BRIDGE,
+                HyperWidgetType.MIUI_CALENDAR_BRIDGE,
                 HyperWidgetType.DEVICE_TELEMETRY,
                 HyperWidgetType.STORAGE_AND_PACKS,
                 HyperWidgetType.MAML_LIVE_DUO
@@ -1992,3 +3326,68 @@ fun WidgetsAndFoldersPickerSheet(
         }
     }
 }
+
+@Composable
+private fun MamlClockWidgetCanvas(
+    spec: com.example.domain.model.MamlClockWidgetSpec,
+    cardWidthDp: Dp,
+    cardHeightDp: Dp,
+    telemetry: DeviceTelemetrySnapshot,
+    customFontPath: String?,
+    widgetId: String
+) {
+    val context = LocalContext.current
+    val density = LocalDensity.current
+    val targetWidthPx = with(density) { cardWidthDp.roundToPx().coerceIn(240, 1440) }
+    val targetHeightPx = with(density) { cardHeightDp.roundToPx().coerceIn(140, 1440) }
+    val is24Hour = remember(context) {
+        android.text.format.DateFormat.is24HourFormat(context)
+    }
+
+    val hasContinuousRotation = remember(spec.rawManifestXml) {
+        spec.rawManifestXml.contains("#time_sys") ||
+            spec.rawManifestXml.contains("#second") ||
+            spec.rawManifestXml.contains("#ms") ||
+            spec.varAnimations.isNotEmpty()
+    }
+
+    var nowTick by remember(spec.directoryPath) { mutableStateOf(System.currentTimeMillis()) }
+    LaunchedEffect(spec.directoryPath, hasContinuousRotation) {
+        val intervalMs = if (hasContinuousRotation) 66L else 1000L
+        while (true) {
+            delay(intervalMs)
+            nowTick = System.currentTimeMillis()
+        }
+    }
+
+    val renderedBitmap = remember(
+        spec,
+        targetWidthPx,
+        targetHeightPx,
+        nowTick,
+        telemetry.weatherCondition,
+        telemetry.weatherTempCelsius,
+        telemetry.weatherCity,
+        customFontPath,
+        is24Hour
+    ) {
+        sharedClockWidgetMamlRenderer.renderWidgetBitmap(
+            spec = spec,
+            targetWidthPx = targetWidthPx,
+            targetHeightPx = targetHeightPx,
+            nowMillis = nowTick,
+            telemetry = telemetry,
+            customFontPath = customFontPath,
+            is24HourFormat = is24Hour
+        ).asImageBitmap()
+    }
+
+    Image(
+        bitmap = renderedBitmap,
+        contentDescription = "MIUI MAML Clock Widget (${spec.moduleName})",
+        modifier = Modifier
+            .fillMaxSize()
+            .testTag("maml_clock_widget_canvas_$widgetId")
+    )
+}
+

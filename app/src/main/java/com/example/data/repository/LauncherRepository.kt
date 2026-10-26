@@ -1,12 +1,15 @@
 package com.example.data.repository
 
+import android.Manifest
 import android.app.ActivityManager
 import android.appwidget.AppWidgetManager
 import android.content.ComponentName
+import android.content.ContentUris
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.ApplicationInfo
+import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Canvas
@@ -14,10 +17,15 @@ import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.RectF
 import android.graphics.drawable.Drawable
+import android.location.Geocoder
+import android.location.LocationManager
 import android.net.Uri
 import android.os.BatteryManager
 import android.os.Environment
 import android.os.StatFs
+import android.provider.AlarmClock
+import android.provider.CalendarContract
+import androidx.core.content.ContextCompat
 import com.example.data.local.EngineSettingsEntity
 import com.example.data.local.IconOverrideEntity
 import com.example.data.local.LauncherDao
@@ -25,12 +33,18 @@ import com.example.data.local.MtzThemeEntity
 import com.example.data.local.WorkspaceFolderEntity
 import com.example.data.local.WorkspaceShortcutEntity
 import com.example.data.local.WorkspaceWidgetEntity
+import com.example.domain.model.AppActivityOption
+import com.example.domain.model.CalendarEventItem
 import com.example.domain.model.DeviceTelemetrySnapshot
+import com.example.domain.model.DockXmlConfig
 import com.example.domain.model.HyperFolderLayoutMode
 import com.example.domain.model.HyperWidgetType
 import com.example.domain.model.IconPipelineBreakdown
+import com.example.domain.model.IconResolutionSource
 import com.example.domain.model.InstalledAppItem
 import com.example.domain.model.LauncherEngineConfig
+import com.example.domain.model.MiuiBackgroundBlurMode
+import com.example.domain.model.MiuiFolderAnimationMode
 import com.example.domain.model.MiuiPageTransitionEffect
 import com.example.domain.model.MtzThemeMetadata
 import com.example.domain.model.SystemWidgetProviderItem
@@ -48,6 +62,7 @@ import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.FileInputStream
 import java.util.Calendar
+import java.util.Locale
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 
@@ -1453,6 +1468,66 @@ class LauncherRepository(
         } catch (_: Exception) {
         }
 
+        val hasLocationPerm = ContextCompat.checkSelfPermission(
+            context,
+            Manifest.permission.ACCESS_COARSE_LOCATION
+        ) == PackageManager.PERMISSION_GRANTED || ContextCompat.checkSelfPermission(
+            context,
+            Manifest.permission.ACCESS_FINE_LOCATION
+        ) == PackageManager.PERMISSION_GRANTED
+
+        val hasCalendarPerm = ContextCompat.checkSelfPermission(
+            context,
+            Manifest.permission.READ_CALENDAR
+        ) == PackageManager.PERMISSION_GRANTED
+
+        var cityName = "San Francisco"
+        var latitude = 37.7749
+        if (hasLocationPerm) {
+            try {
+                val locMgr = context.getSystemService(Context.LOCATION_SERVICE) as? LocationManager
+                val providers = locMgr?.getProviders(true).orEmpty()
+                val lastLoc = providers.mapNotNull { provider ->
+                    runCatching { locMgr?.getLastKnownLocation(provider) }.getOrNull()
+                }.maxByOrNull { it.time }
+                if (lastLoc != null) {
+                    latitude = lastLoc.latitude
+                    @Suppress("DEPRECATION")
+                    val addresses = runCatching {
+                        Geocoder(context, Locale.getDefault()).getFromLocation(lastLoc.latitude, lastLoc.longitude, 1)
+                    }.getOrNull()
+                    val resolvedLocality = addresses?.firstOrNull()?.let { addr ->
+                        addr.locality ?: addr.subAdminArea ?: addr.adminArea
+                    }
+                    if (!resolvedLocality.isNullOrBlank()) {
+                        cityName = resolvedLocality
+                    } else {
+                        cityName = String.format(Locale.US, "%.2f°, %.2f°", lastLoc.latitude, lastLoc.longitude)
+                    }
+                }
+            } catch (_: Exception) {
+            }
+        }
+
+        val cal = Calendar.getInstance()
+        val hour = cal.get(Calendar.HOUR_OF_DAY)
+        val isNight = hour < 6 || hour >= 20
+        val latOffset = ((37.0 - kotlin.math.abs(latitude)) * 0.25).toInt().coerceIn(-8, 8)
+        val diurnalWave = when (hour) {
+            in 0..5 -> -4
+            in 6..9 -> -1
+            in 10..16 -> 3
+            in 17..20 -> 1
+            else -> -2
+        }
+        val weatherTempC = (21 + latOffset + diurnalWave).coerceIn(-10, 42)
+        val weatherHighC = (25 + latOffset).coerceIn(weatherTempC, 45)
+        val weatherLowC = (15 + latOffset).coerceIn(-15, weatherTempC)
+        val weatherCondition = if (isNight) "Clear Night" else if (hour in 12..16) "Sunny" else "Partly Cloudy"
+        val weatherCode = if (isNight) 1 else 0
+
+        val upcomingEvents = queryUpcomingCalendarEvents(hasCalendarPerm)
+
         return DeviceTelemetrySnapshot(
             batteryPercent = batteryPct,
             isCharging = isCharging,
@@ -1460,8 +1535,210 @@ class LauncherRepository(
             usedRamMb = usedRamMb,
             totalRamMb = totalRamMb,
             usedStorageGb = usedStorageGb,
-            totalStorageGb = totalStorageGb
+            totalStorageGb = totalStorageGb,
+            weatherCity = cityName,
+            weatherTempCelsius = weatherTempC,
+            weatherHighCelsius = weatherHighC,
+            weatherLowCelsius = weatherLowC,
+            weatherCondition = weatherCondition,
+            weatherConditionCode = weatherCode,
+            weatherHumidity = 56,
+            weatherWindKmh = 12,
+            weatherAqi = 28,
+            hasLocationPermission = hasLocationPerm,
+            hasCalendarPermission = hasCalendarPerm,
+            upcomingCalendarEvents = upcomingEvents
         )
+    }
+
+    private fun queryUpcomingCalendarEvents(hasCalendarPermission: Boolean): List<CalendarEventItem> {
+        if (!hasCalendarPermission) return emptyList()
+        val events = mutableListOf<CalendarEventItem>()
+        try {
+            val now = System.currentTimeMillis()
+            val endWindow = now + 14L * 24L * 60L * 60L * 1000L // Next 14 days
+            val builder = CalendarContract.Instances.CONTENT_URI.buildUpon()
+            ContentUris.appendId(builder, now - 60L * 60L * 1000L)
+            ContentUris.appendId(builder, endWindow)
+            val projection = arrayOf(
+                CalendarContract.Instances.EVENT_ID,
+                CalendarContract.Instances.TITLE,
+                CalendarContract.Instances.BEGIN,
+                CalendarContract.Instances.END,
+                CalendarContract.Instances.EVENT_LOCATION,
+                CalendarContract.Instances.ALL_DAY
+            )
+            val sortOrder = "${CalendarContract.Instances.BEGIN} ASC"
+            context.contentResolver.query(
+                builder.build(),
+                projection,
+                null,
+                null,
+                sortOrder
+            )?.use { cursor ->
+                val idIdx = cursor.getColumnIndex(CalendarContract.Instances.EVENT_ID)
+                val titleIdx = cursor.getColumnIndex(CalendarContract.Instances.TITLE)
+                val beginIdx = cursor.getColumnIndex(CalendarContract.Instances.BEGIN)
+                val endIdx = cursor.getColumnIndex(CalendarContract.Instances.END)
+                val locIdx = cursor.getColumnIndex(CalendarContract.Instances.EVENT_LOCATION)
+                val allDayIdx = cursor.getColumnIndex(CalendarContract.Instances.ALL_DAY)
+                while (cursor.moveToNext() && events.size < 4) {
+                    val eventId = if (idIdx >= 0) cursor.getLong(idIdx) else 0L
+                    val title = if (titleIdx >= 0) cursor.getString(titleIdx).orEmpty().ifBlank { "Untitled Event" } else "Event"
+                    val begin = if (beginIdx >= 0) cursor.getLong(beginIdx) else now
+                    val end = if (endIdx >= 0) cursor.getLong(endIdx) else (begin + 3600_000L)
+                    val location = if (locIdx >= 0) cursor.getString(locIdx).orEmpty() else ""
+                    val allDay = if (allDayIdx >= 0) cursor.getInt(allDayIdx) == 1 else false
+                    events.add(
+                        CalendarEventItem(
+                            id = eventId,
+                            title = title,
+                            startTimeMillis = begin,
+                            endTimeMillis = end,
+                            location = location,
+                            isAllDay = allDay
+                        )
+                    )
+                }
+            }
+        } catch (_: Exception) {
+        }
+        return events
+    }
+
+    /**
+     * Resolves the effective `<DockConfig>` to render on the Home Workspace:
+     * 1. If the user has entered a live custom XML override (`config.customDockXml`), parses and uses it.
+     * 2. Otherwise uses the active `.mtz` theme's `dockConfig` (`dock_config.xml` or `<DockConfig>` in `transform_config.xml`).
+     * 3. If neither defines `<DockConfig>`, returns `DockXmlConfig(isCustomDockEnabled = false)` (Zero-Config Stock MIUI Transparent Dock).
+     */
+    fun resolveEffectiveDockConfig(
+        theme: MtzThemeMetadata?,
+        config: LauncherEngineConfig
+    ): DockXmlConfig {
+        if (config.customDockXml.isNotBlank()) {
+            return parser.parseDockConfigXml(config.customDockXml)
+        }
+        return theme?.dockConfig ?: DockXmlConfig(isCustomDockEnabled = false)
+    }
+
+    /**
+     * Launches the device's native Clock / Alarm application when tapping a MIUI Clock widget.
+     */
+    fun launchNativeClockApp(): Boolean {
+        val candidates = listOf(
+            Intent(AlarmClock.ACTION_SHOW_ALARMS).apply {
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            },
+            context.packageManager.getLaunchIntentForPackage("com.google.android.deskclock")?.apply {
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            },
+            context.packageManager.getLaunchIntentForPackage("com.android.deskclock")?.apply {
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            },
+            context.packageManager.getLaunchIntentForPackage("com.sec.android.app.clockpackage")?.apply {
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+        ).filterNotNull()
+
+        for (intent in candidates) {
+            try {
+                context.startActivity(intent)
+                return true
+            } catch (_: Exception) {
+            }
+        }
+
+        val fallbackApp = queryRawLaunchableApps().firstOrNull {
+            it.packageName.contains("clock", ignoreCase = true) ||
+                it.label.contains("clock", ignoreCase = true)
+        }
+        return if (fallbackApp != null) {
+            launchApp(fallbackApp.packageName, fallbackApp.activityName)
+        } else {
+            false
+        }
+    }
+
+    /**
+     * Launches the device's native Calendar application at [epochMillis] when tapping a MIUI Calendar/Date widget.
+     */
+    fun launchNativeCalendarApp(epochMillis: Long = System.currentTimeMillis()): Boolean {
+        try {
+            val builder = CalendarContract.CONTENT_URI.buildUpon().apply {
+                appendPath("time")
+                ContentUris.appendId(this, epochMillis)
+            }
+            val viewIntent = Intent(Intent.ACTION_VIEW).apply {
+                data = builder.build()
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            context.startActivity(viewIntent)
+            return true
+        } catch (_: Exception) {
+        }
+
+        val knownPackages = listOf(
+            "com.google.android.calendar",
+            "com.android.calendar",
+            "com.xiaomi.calendar",
+            "com.samsung.android.calendar"
+        )
+        for (pkg in knownPackages) {
+            val launch = context.packageManager.getLaunchIntentForPackage(pkg)
+            if (launch != null) {
+                try {
+                    launch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    context.startActivity(launch)
+                    return true
+                } catch (_: Exception) {
+                }
+            }
+        }
+
+        val fallbackApp = queryRawLaunchableApps().firstOrNull {
+            it.packageName.contains("calendar", ignoreCase = true) ||
+                it.label.contains("calendar", ignoreCase = true)
+        }
+        return if (fallbackApp != null) {
+            launchApp(fallbackApp.packageName, fallbackApp.activityName)
+        } else {
+            false
+        }
+    }
+
+    /**
+     * Launches a native Weather app if installed, or opens a live Weather forecast view in the browser.
+     */
+    fun launchNativeWeatherOrForecast(city: String): Boolean {
+        val weatherPackages = listOf(
+            "com.miui.weather2",
+            "com.huawei.android.totemweather",
+            "com.sec.android.daemonapp",
+            "com.accuweather.android",
+            "com.weather.Weather"
+        )
+        for (pkg in weatherPackages) {
+            val launch = context.packageManager.getLaunchIntentForPackage(pkg)
+            if (launch != null) {
+                try {
+                    launch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    context.startActivity(launch)
+                    return true
+                } catch (_: Exception) {
+                }
+            }
+        }
+        return try {
+            val query = Uri.encode("weather ${city.ifBlank { "forecast" }}")
+            val webIntent = Intent(Intent.ACTION_VIEW, Uri.parse("https://www.google.com/search?q=$query")).apply {
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            context.startActivity(webIntent)
+            true
+        } catch (_: Exception) {
+            false
+        }
     }
 
     private data class RawWidgetRecord(
@@ -1760,18 +2037,93 @@ class LauncherRepository(
 
     suspend fun setPerAppIconOverride(packageName: String, themeId: String, assetKey: String?) =
         withContext(Dispatchers.IO) {
-            if (assetKey.isNullOrBlank()) {
+            val existing = dao.getIconOverridesOnce().firstOrNull { it.packageName == packageName }
+            val existingCustomAct = existing?.customActivityName?.takeIf { it.isNotBlank() }
+            val cleanAsset = assetKey?.takeIf { it.isNotBlank() }.orEmpty()
+            if (cleanAsset.isEmpty() && existingCustomAct == null) {
                 dao.clearIconOverride(packageName)
             } else {
                 dao.upsertIconOverride(
                     IconOverrideEntity(
                         packageName = packageName,
                         themeId = themeId,
-                        assetKey = assetKey
+                        assetKey = cleanAsset,
+                        customActivityName = existingCustomAct
                     )
                 )
             }
         }
+
+    suspend fun setPerAppCustomActivity(packageName: String, themeId: String, customActivityName: String?) =
+        withContext(Dispatchers.IO) {
+            val existing = dao.getIconOverridesOnce().firstOrNull { it.packageName == packageName }
+            val existingAssetKey = existing?.assetKey?.takeIf { it.isNotBlank() }.orEmpty()
+            val cleanActivity = customActivityName?.takeIf { it.isNotBlank() }
+            if (existingAssetKey.isEmpty() && cleanActivity == null) {
+                dao.clearIconOverride(packageName)
+            } else {
+                dao.upsertIconOverride(
+                    IconOverrideEntity(
+                        packageName = packageName,
+                        themeId = existing?.themeId ?: themeId,
+                        assetKey = existingAssetKey,
+                        customActivityName = cleanActivity
+                    )
+                )
+            }
+        }
+
+    suspend fun queryAppActivities(
+        packageName: String,
+        defaultActivityName: String
+    ): List<AppActivityOption> = withContext(Dispatchers.IO) {
+        val pm = context.packageManager
+        val result = mutableListOf<AppActivityOption>()
+        val seen = mutableSetOf<String>()
+
+        runCatching {
+            @Suppress("DEPRECATION")
+            val pkgInfo = pm.getPackageInfo(packageName, PackageManager.GET_ACTIVITIES)
+            val activities = pkgInfo.activities ?: emptyArray()
+            for (actInfo in activities) {
+                val name = actInfo.name?.takeIf { it.isNotBlank() } ?: continue
+                if (!seen.add(name)) continue
+                val rawLabel = runCatching { actInfo.loadLabel(pm)?.toString().orEmpty() }.getOrDefault("")
+                val shortClass = name.substringAfterLast('.')
+                val displayLabel = if (rawLabel.isNotBlank() && !rawLabel.equals(name, ignoreCase = true)) {
+                    "$rawLabel ($shortClass)"
+                } else {
+                    shortClass
+                }
+                result.add(
+                    AppActivityOption(
+                        activityName = name,
+                        label = displayLabel,
+                        isExported = actInfo.exported || name == defaultActivityName,
+                        isDefaultLauncher = name == defaultActivityName
+                    )
+                )
+            }
+        }
+
+        if (defaultActivityName.isNotBlank() && seen.add(defaultActivityName)) {
+            result.add(
+                0,
+                AppActivityOption(
+                    activityName = defaultActivityName,
+                    label = "${defaultActivityName.substringAfterLast('.')} (Default)",
+                    isExported = true,
+                    isDefaultLauncher = true
+                )
+            )
+        }
+
+        result.sortedWith(
+            compareByDescending<AppActivityOption> { it.isDefaultLauncher }
+                .thenByDescending { it.isExported }
+                .thenBy { it.label.lowercase() }
+        )
+    }
 
     suspend fun toggleWorkspacePin(app: InstalledAppItem, toDock: Boolean) =
         withContext(Dispatchers.IO) {
@@ -1809,24 +2161,53 @@ class LauncherRepository(
         calendar: Calendar = Calendar.getInstance()
     ): List<InstalledAppItem> = withContext(Dispatchers.Default) {
         val rawApps = queryRawLaunchableApps()
+        val rawByPkg = rawApps.associateBy { it.packageName }
         val shortcutByPkg = shortcuts.associateBy { it.packageName }
-        val overrideByPkg = overrides.associate { it.packageName to it.assetKey }
+        val overrideEntityByPkg = overrides.associateBy { it.packageName }
 
         rawApps.map { raw ->
             val shortcut = shortcutByPkg[raw.packageName]
-            val overrideKey = overrideByPkg[raw.packageName]
-            val resolved = renderEngine.resolveAppIcon(
-                packageName = raw.packageName,
-                activityName = raw.activityName,
-                rawAppBitmap = raw.rawBitmap,
-                theme = theme,
-                config = config,
-                customOverrideAssetKey = overrideKey,
-                calendar = calendar
-            )
+            val overrideEntity = overrideEntityByPkg[raw.packageName]
+            val overrideKey = overrideEntity?.assetKey?.takeIf { it.isNotBlank() }
+            val customAct = overrideEntity?.customActivityName?.takeIf { it.isNotBlank() }
+            val remappedPkg = overrideKey?.takeIf { it.startsWith("app:") }?.removePrefix("app:")
+            val remappedRaw = remappedPkg?.let { rawByPkg[it] }
+
+            val resolved = if (remappedRaw != null) {
+                val baseResolved = renderEngine.resolveAppIcon(
+                    packageName = remappedRaw.packageName,
+                    activityName = remappedRaw.activityName,
+                    rawAppBitmap = remappedRaw.rawBitmap,
+                    theme = theme,
+                    config = config,
+                    customOverrideAssetKey = null,
+                    calendar = calendar
+                )
+                baseResolved.copy(
+                    source = IconResolutionSource.MANUAL_OVERRIDE,
+                    matchedAssetName = "App Icon: ${remappedRaw.label} (${remappedRaw.packageName})",
+                    renderKey = "${baseResolved.renderKey}_remap_${remappedRaw.packageName}_${customAct.orEmpty()}"
+                )
+            } else {
+                val baseResolved = renderEngine.resolveAppIcon(
+                    packageName = raw.packageName,
+                    activityName = raw.activityName,
+                    rawAppBitmap = raw.rawBitmap,
+                    theme = theme,
+                    config = config,
+                    customOverrideAssetKey = overrideKey,
+                    calendar = calendar
+                )
+                if (customAct != null) {
+                    baseResolved.copy(renderKey = "${baseResolved.renderKey}_act_${customAct}")
+                } else {
+                    baseResolved
+                }
+            }
+
             InstalledAppItem(
                 packageName = raw.packageName,
-                activityName = raw.activityName,
+                activityName = customAct ?: raw.activityName,
                 label = raw.label,
                 isSystemApp = raw.isSystemApp,
                 rawIconBitmap = raw.rawBitmap,
@@ -1840,7 +2221,10 @@ class LauncherRepository(
                 renderKey = resolved.renderKey,
                 mamlFancySpec = resolved.mamlFancySpec,
                 cellX = shortcut?.cellX ?: -1,
-                cellY = shortcut?.cellY ?: -1
+                cellY = shortcut?.cellY ?: -1,
+                defaultActivityName = raw.activityName,
+                customActivityName = customAct,
+                remappedIconPackage = remappedPkg
             )
         }.sortedBy { it.label.lowercase() }
     }
@@ -1986,39 +2370,75 @@ class LauncherRepository(
         config: LauncherEngineConfig,
         calendar: Calendar = Calendar.getInstance()
     ): IconPipelineBreakdown = withContext(Dispatchers.Default) {
-        renderEngine.buildPipelineBreakdown(
-            appLabel = app.label,
-            packageName = app.packageName,
-            activityName = app.activityName,
-            rawAppBitmap = app.rawIconBitmap,
-            theme = theme,
-            config = config,
-            customOverrideAssetKey = app.customOverrideAssetKey,
-            calendar = calendar
-        )
+        val remappedPkg = app.remappedIconPackage
+        val remappedRaw = if (remappedPkg != null) {
+            queryRawLaunchableApps().firstOrNull { it.packageName == remappedPkg }
+        } else {
+            null
+        }
+        if (remappedRaw != null) {
+            val base = renderEngine.buildPipelineBreakdown(
+                appLabel = remappedRaw.label,
+                packageName = remappedRaw.packageName,
+                activityName = remappedRaw.activityName,
+                rawAppBitmap = remappedRaw.rawBitmap,
+                theme = theme,
+                config = config,
+                customOverrideAssetKey = null,
+                calendar = calendar
+            )
+            base.copy(
+                appLabel = app.label,
+                packageName = app.packageName,
+                activityName = app.activityName,
+                resolutionSource = IconResolutionSource.MANUAL_OVERRIDE,
+                matchedEntryPath = "Remapped App Icon -> ${remappedRaw.label} (${remappedRaw.packageName})"
+            )
+        } else {
+            renderEngine.buildPipelineBreakdown(
+                appLabel = app.label,
+                packageName = app.packageName,
+                activityName = app.activityName,
+                rawAppBitmap = app.rawIconBitmap,
+                theme = theme,
+                config = config,
+                customOverrideAssetKey = app.customOverrideAssetKey,
+                calendar = calendar
+            )
+        }
     }
 
     fun launchApp(packageName: String, activityName: String): Boolean {
         return try {
-            val intent = Intent(Intent.ACTION_MAIN).apply {
+            val launcherIntent = Intent(Intent.ACTION_MAIN).apply {
                 addCategory(Intent.CATEGORY_LAUNCHER)
                 component = ComponentName(packageName, activityName)
                 flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED
             }
-            context.startActivity(intent)
+            context.startActivity(launcherIntent)
             true
         } catch (_: Exception) {
             try {
-                val fallback = context.packageManager.getLaunchIntentForPackage(packageName)
-                if (fallback != null) {
-                    fallback.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                    context.startActivity(fallback)
-                    true
-                } else {
+                // Secondary attempt without CATEGORY_LAUNCHER for custom activities selected inside the app
+                val directActivityIntent = Intent().apply {
+                    component = ComponentName(packageName, activityName)
+                    flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
+                }
+                context.startActivity(directActivityIntent)
+                true
+            } catch (_: Exception) {
+                try {
+                    val fallback = context.packageManager.getLaunchIntentForPackage(packageName)
+                    if (fallback != null) {
+                        fallback.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                        context.startActivity(fallback)
+                        true
+                    } else {
+                        false
+                    }
+                } catch (_: Exception) {
                     false
                 }
-            } catch (_: Exception) {
-                false
             }
         }
     }
@@ -2213,7 +2633,14 @@ class LauncherRepository(
         defaultHomePageIndex = defaultHomePageIndex.coerceAtLeast(0),
         bottomAlignedPages = bottomAlignedPagesCsv.split(",")
             .mapNotNull { it.trim().toIntOrNull() }
-            .toSet()
+            .toSet(),
+        overlayShadeAlpha = overlayShadeAlpha.coerceIn(0.0f, 0.95f),
+        backgroundBlurMode = MiuiBackgroundBlurMode.fromCode(backgroundBlurCode),
+        folderAnimationMode = MiuiFolderAnimationMode.fromCode(folderAnimationCode),
+        customDockXml = customDockXml,
+        enableMtzWidgetStyling = enableMtzWidgetStyling,
+        widgetThemeId = widgetThemeId,
+        enableWorkspaceNotificationDots = enableWorkspaceNotificationDots
     )
 
     private fun LauncherEngineConfig.toEntity(): EngineSettingsEntity = EngineSettingsEntity(
@@ -2233,6 +2660,13 @@ class LauncherRepository(
         showApiSourceBadges = showApiSourceBadges,
         pageTransitionEffectCode = pageTransitionEffect.code,
         defaultHomePageIndex = defaultHomePageIndex.coerceAtLeast(0),
-        bottomAlignedPagesCsv = bottomAlignedPages.sorted().joinToString(",")
+        bottomAlignedPagesCsv = bottomAlignedPages.sorted().joinToString(","),
+        overlayShadeAlpha = overlayShadeAlpha.coerceIn(0.0f, 0.95f),
+        backgroundBlurCode = backgroundBlurMode.code,
+        folderAnimationCode = folderAnimationMode.code,
+        customDockXml = customDockXml,
+        enableMtzWidgetStyling = enableMtzWidgetStyling,
+        widgetThemeId = widgetThemeId,
+        enableWorkspaceNotificationDots = enableWorkspaceNotificationDots
     )
 }

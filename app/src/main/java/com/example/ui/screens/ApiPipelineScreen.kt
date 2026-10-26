@@ -78,6 +78,9 @@ fun ApiPipelineScreen(
     onToggleColorMatrix: (Boolean) -> Unit = {},
     onToggleLighting: (Boolean) -> Unit = {},
     onAssignOverrideAsset: (String, String?) -> Unit,
+    inspectedAppActivities: List<com.example.domain.model.AppActivityOption> = emptyList(),
+    onRemapAppIconToPackage: (String, String?) -> Unit = { _, _ -> },
+    onSelectCustomLaunchActivity: (String, String?) -> Unit = { _, _ -> },
     onClosePipeline: () -> Unit = {}
 ) {
     BackHandler(onBack = onClosePipeline)
@@ -516,6 +519,200 @@ fun ApiPipelineScreen(
                             onCheckedChange = onToggleLighting,
                             tag = "toggle_lighting_filter"
                         )
+                    }
+                }
+            }
+
+            // Remap App Icon to Another Installed App & Select Launch Activity (Original App Only)
+            item {
+                Surface(
+                    color = SlateSurface,
+                    shape = RoundedCornerShape(16.dp),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .border(1.dp, SlateBorder, RoundedCornerShape(16.dp))
+                ) {
+                    Column(
+                        modifier = Modifier.padding(14.dp),
+                        verticalArrangement = Arrangement.spacedBy(12.dp)
+                    ) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    text = "Remap ${inspectedApp.label} Icon to Another App",
+                                    style = MaterialTheme.typography.titleSmall,
+                                    color = TextPrimary
+                                )
+                                Text(
+                                    text = if (inspectedApp.remappedIconPackage != null) {
+                                        "Using themed icon from: ${inspectedApp.remappedIconPackage}"
+                                    } else {
+                                        "Pick any installed app to use its themed icon while keeping ${inspectedApp.packageName} launch"
+                                    },
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = if (inspectedApp.remappedIconPackage != null) EmeraldBright else TextSecondary
+                                )
+                            }
+                            if (inspectedApp.remappedIconPackage != null) {
+                                Text(
+                                    text = "Reset App Icon",
+                                    style = MaterialTheme.typography.labelMedium,
+                                    color = EmeraldBright,
+                                    modifier = Modifier
+                                        .clip(RoundedCornerShape(6.dp))
+                                        .clickable { onRemapAppIconToPackage(inspectedApp.packageName, null) }
+                                        .padding(4.dp)
+                                        .testTag("inspector_reset_remapped_app_icon")
+                                )
+                            }
+                        }
+
+                        LazyRow(
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            contentPadding = PaddingValues(vertical = 2.dp),
+                            modifier = Modifier.testTag("inspector_remap_app_icon_row")
+                        ) {
+                            items(allApps, key = { "remap_${it.packageName}" }) { candidate ->
+                                val isSelected = inspectedApp.remappedIconPackage == candidate.packageName
+                                Column(
+                                    horizontalAlignment = Alignment.CenterHorizontally,
+                                    modifier = Modifier
+                                        .width(66.dp)
+                                        .clip(RoundedCornerShape(10.dp))
+                                        .background(if (isSelected) EmeraldContainer else SlateSurfaceElevated)
+                                        .border(
+                                            width = if (isSelected) 1.5.dp else 1.dp,
+                                            color = if (isSelected) EmeraldBright else SlateBorder,
+                                            shape = RoundedCornerShape(10.dp)
+                                        )
+                                        .clickable {
+                                            onRemapAppIconToPackage(
+                                                inspectedApp.packageName,
+                                                if (isSelected) null else candidate.packageName
+                                            )
+                                        }
+                                        .padding(6.dp)
+                                        .testTag("inspector_remap_to_${candidate.packageName}")
+                                ) {
+                                    Image(
+                                        bitmap = candidate.themedIconBitmap.asImageBitmap(),
+                                        contentDescription = candidate.label,
+                                        modifier = Modifier.size(38.dp)
+                                    )
+                                    Spacer(modifier = Modifier.height(4.dp))
+                                    Text(
+                                        text = candidate.label,
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = if (isSelected) EmeraldBright else TextSecondary,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                }
+                            }
+                        }
+
+                        HorizontalDivider(color = SlateBorder)
+
+                        // Launch Activity Selector (strictly within the original app only)
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    text = "Launch Activity (${inspectedApp.packageName} Only)",
+                                    style = MaterialTheme.typography.titleSmall,
+                                    color = TextPrimary
+                                )
+                                Text(
+                                    text = inspectedApp.customActivityName?.substringAfterLast('.')
+                                        ?: "Default (${inspectedApp.defaultActivityName.substringAfterLast('.').ifBlank { "MainLauncher" }})",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = if (inspectedApp.customActivityName != null) EmeraldBright else TextSecondary
+                                )
+                            }
+                            if (inspectedApp.customActivityName != null) {
+                                Text(
+                                    text = "Reset Default",
+                                    style = MaterialTheme.typography.labelMedium,
+                                    color = EmeraldBright,
+                                    modifier = Modifier
+                                        .clip(RoundedCornerShape(6.dp))
+                                        .clickable { onSelectCustomLaunchActivity(inspectedApp.packageName, null) }
+                                        .padding(4.dp)
+                                        .testTag("inspector_reset_launch_activity")
+                                )
+                            }
+                        }
+
+                        if (inspectedAppActivities.isNotEmpty()) {
+                            Column(
+                                verticalArrangement = Arrangement.spacedBy(6.dp),
+                                modifier = Modifier.testTag("inspector_activity_list")
+                            ) {
+                                inspectedAppActivities.take(8).forEach { actOption ->
+                                    val isCurrent = if (inspectedApp.customActivityName != null) {
+                                        inspectedApp.customActivityName == actOption.activityName
+                                    } else {
+                                        actOption.isDefaultLauncher
+                                    }
+                                    Surface(
+                                        color = if (isCurrent) EmeraldContainer else SlateSurfaceElevated,
+                                        shape = RoundedCornerShape(10.dp),
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .border(
+                                                width = if (isCurrent) 1.5.dp else 1.dp,
+                                                color = if (isCurrent) EmeraldBright else SlateBorder,
+                                                shape = RoundedCornerShape(10.dp)
+                                            )
+                                            .clickable {
+                                                val chosen = if (actOption.isDefaultLauncher) null else actOption.activityName
+                                                onSelectCustomLaunchActivity(inspectedApp.packageName, chosen)
+                                            }
+                                            .testTag("inspector_activity_${actOption.activityName.substringAfterLast('.')}")
+                                    ) {
+                                        Row(
+                                            modifier = Modifier
+                                                .fillMaxWidth()
+                                                .padding(horizontal = 12.dp, vertical = 8.dp),
+                                            horizontalArrangement = Arrangement.SpaceBetween,
+                                            verticalAlignment = Alignment.CenterVertically
+                                        ) {
+                                            Column(modifier = Modifier.weight(1f)) {
+                                                Text(
+                                                    text = actOption.label,
+                                                    style = MaterialTheme.typography.labelMedium,
+                                                    color = if (isCurrent) EmeraldBright else TextPrimary,
+                                                    maxLines = 1,
+                                                    overflow = TextOverflow.Ellipsis
+                                                )
+                                                Text(
+                                                    text = actOption.activityName,
+                                                    style = MaterialTheme.typography.bodySmall,
+                                                    color = TextSecondary,
+                                                    maxLines = 1,
+                                                    overflow = TextOverflow.Ellipsis
+                                                )
+                                            }
+                                            if (actOption.isDefaultLauncher) {
+                                                Text(
+                                                    text = "DEFAULT",
+                                                    style = MaterialTheme.typography.labelSmall,
+                                                    color = EmeraldBright,
+                                                    modifier = Modifier.padding(start = 8.dp)
+                                                )
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }

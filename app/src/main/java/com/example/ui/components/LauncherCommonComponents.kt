@@ -15,6 +15,7 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.defaultMinSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.offset
@@ -169,10 +170,12 @@ fun Modifier.miuiIconTapLongPressAndDrag(
                 val startLocalPos = down.position
                 val startRootPos = toRootOffset(down.position, down.position, Offset.Zero)
                 val touchSlop = viewConfiguration.touchSlop
+                val tapCancelSlop = minOf(touchSlop, 8.dp.toPx())
                 val longPressTimeout = viewConfiguration.longPressTimeoutMillis.coerceIn(300L, 420L)
 
                 var latestLocalPos = startLocalPos
                 var latestRootPos = startRootPos
+                var maxMovedDistPx = 0f
                 var releasedBeforeLongPress = false
                 var cancelledByScrollOrSlop = false
                 var startedImmediateDrag = false
@@ -188,32 +191,43 @@ fun Modifier.miuiIconTapLongPressAndDrag(
                         latestLocalPos = change.position
                         latestRootPos = toRootOffset(change.position, latestRootPos, Offset.Zero)
 
-                        if (!change.pressed) {
-                            change.consume()
-                            releasedBeforeLongPress = true
+                        val localDist = (latestLocalPos - startLocalPos).getDistance()
+                        val rootDist = (latestRootPos - startRootPos).getDistance()
+                        val currentDist = maxOf(localDist, rootDist)
+                        if (currentDist > maxMovedDistPx) {
+                            maxMovedDistPx = currentDist
+                        }
+
+                        if (change.isConsumed || event.changes.any { it.isConsumed }) {
+                            cancelledByScrollOrSlop = true
                             break
                         }
 
-                        val distFromStart = (latestRootPos - startRootPos).getDistance()
-                        if (distFromStart > touchSlop) {
-                            if (currentEnableImmediateDrag) {
+                        if (!change.pressed) {
+                            if (maxMovedDistPx > tapCancelSlop) {
+                                cancelledByScrollOrSlop = true
+                            } else {
+                                change.consume()
+                                releasedBeforeLongPress = true
+                            }
+                            break
+                        }
+
+                        if (maxMovedDistPx > tapCancelSlop) {
+                            if (currentEnableImmediateDrag && maxMovedDistPx > touchSlop) {
                                 change.consume()
                                 startedImmediateDrag = true
                                 break
-                            } else {
+                            } else if (!currentEnableImmediateDrag) {
                                 cancelledByScrollOrSlop = true
                                 break
                             }
-                        }
-                        if (change.isConsumed) {
-                            cancelledByScrollOrSlop = true
-                            break
                         }
                     }
                     false
                 } ?: true
 
-                if (releasedBeforeLongPress && !cancelledByScrollOrSlop && !startedImmediateDrag) {
+                if (releasedBeforeLongPress && !cancelledByScrollOrSlop && !startedImmediateDrag && maxMovedDistPx <= tapCancelSlop) {
                     currentOnTapWithOffset?.invoke(latestRootPos) ?: currentOnTap()
                 } else if ((timedOut || startedImmediateDrag) && !cancelledByScrollOrSlop && !releasedBeforeLongPress) {
                     val longPressRootPos = latestRootPos
@@ -285,7 +299,10 @@ fun AppIconTile(
     showEditSelectionBadge: Boolean = false,
     isSelectedForEdit: Boolean = false,
     enableClickHandling: Boolean = true,
-    isPickedUp: Boolean = false
+    isPickedUp: Boolean = false,
+    hasNotificationDot: Boolean = false,
+    notificationCount: Int = 0,
+    animRestartKey: Any = 0
 ) {
     val mamlSpec = app.mamlFancySpec
     var liveBitmap by remember(app.renderKey, app.themedIconBitmap) {
@@ -293,7 +310,7 @@ fun AppIconTile(
     }
 
     if (mamlSpec != null && (mamlSpec.variables.isNotEmpty() || mamlSpec.isLiveClockOrCalendar)) {
-        androidx.compose.runtime.LaunchedEffect(app.renderKey, mamlSpec.targetPackage) {
+        androidx.compose.runtime.LaunchedEffect(app.renderKey, mamlSpec.targetPackage, animRestartKey) {
             if (mamlSpec.variables.isNotEmpty()) {
                 val startMs = androidx.compose.runtime.withFrameMillis { it }
                 val durationMs = 1050L
@@ -375,6 +392,45 @@ fun AppIconTile(
                         style = MaterialTheme.typography.labelSmall,
                         color = EmeraldBright,
                         modifier = Modifier.padding(horizontal = 3.dp, vertical = 1.dp)
+                    )
+                }
+            }
+            // MIUI Notification Count Pill Badge ("1", "20", "99+") or Mini-Pill Dot Badge (Workspace & Dock only, never App Drawer)
+            if (!showEditSelectionBadge) {
+                val miuiBadgeOrange = Color(0xFFF46A1F)
+                if (notificationCount > 0) {
+                    val countLabel = if (notificationCount > 99) "99+" else notificationCount.toString()
+                    Box(
+                        contentAlignment = Alignment.Center,
+                        modifier = Modifier
+                            .align(Alignment.TopEnd)
+                            .offset(x = 5.dp, y = (-3).dp)
+                            .defaultMinSize(minWidth = 22.dp, minHeight = 15.dp)
+                            .height(15.dp)
+                            .clip(RoundedCornerShape(50))
+                            .background(miuiBadgeOrange)
+                            .padding(horizontal = 5.dp)
+                            .testTag("notification_dot_${app.packageName}")
+                    ) {
+                        Text(
+                            text = countLabel,
+                            color = Color.White,
+                            fontSize = 10.sp,
+                            fontWeight = FontWeight.Bold,
+                            lineHeight = 10.sp,
+                            textAlign = TextAlign.Center,
+                            modifier = Modifier.testTag("notification_count_${app.packageName}")
+                        )
+                    }
+                } else if (hasNotificationDot) {
+                    Box(
+                        modifier = Modifier
+                            .align(Alignment.TopEnd)
+                            .offset(x = 3.dp, y = (-2).dp)
+                            .size(width = 12.dp, height = 8.dp)
+                            .clip(RoundedCornerShape(50))
+                            .background(miuiBadgeOrange)
+                            .testTag("notification_dot_${app.packageName}")
                     )
                 }
             }
@@ -593,12 +649,16 @@ private fun shortCodeForSource(source: IconResolutionSource): String = when (sou
 fun AppActionBottomSheet(
     app: InstalledAppItem,
     iconCatalog: List<CatalogIconEntry>,
+    allApps: List<InstalledAppItem> = emptyList(),
+    appActivities: List<com.example.domain.model.AppActivityOption> = emptyList(),
     onDismiss: () -> Unit,
     onLaunch: () -> Unit,
     onInspectPipeline: () -> Unit,
     onToggleWorkspacePin: () -> Unit,
     onToggleDockPin: () -> Unit,
-    onSelectOverrideAsset: (String?) -> Unit
+    onSelectOverrideAsset: (String?) -> Unit,
+    onRemapIconToApp: (String?) -> Unit = {},
+    onSelectCustomActivity: (String?) -> Unit = {}
 ) {
     ModalBottomSheet(
         onDismissRequest = onDismiss,
@@ -627,9 +687,11 @@ fun AppActionBottomSheet(
                         color = TextPrimary
                     )
                     Text(
-                        text = app.packageName,
+                        text = "${app.packageName} • ${app.activityName.substringAfterLast('.')}",
                         style = MaterialTheme.typography.labelMedium,
-                        color = TextSecondary
+                        color = TextSecondary,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
                     )
                     Spacer(modifier = Modifier.height(4.dp))
                     Row(verticalAlignment = Alignment.CenterVertically) {
@@ -646,7 +708,7 @@ fun AppActionBottomSheet(
                 }
             }
 
-            Spacer(modifier = Modifier.height(16.dp))
+            Spacer(modifier = Modifier.height(14.dp))
 
             Row(
                 modifier = Modifier.fillMaxWidth(),
@@ -738,9 +800,161 @@ fun AppActionBottomSheet(
                 }
             }
 
-            Spacer(modifier = Modifier.height(16.dp))
-            HorizontalDivider(color = SlateBorder)
+            // 1. Remap Icon to Another Installed App
+            if (allApps.isNotEmpty()) {
+                Spacer(modifier = Modifier.height(14.dp))
+                HorizontalDivider(color = SlateBorder)
+                Spacer(modifier = Modifier.height(10.dp))
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = "Remap Icon to Another App",
+                        style = MaterialTheme.typography.titleSmall,
+                        color = TextPrimary
+                    )
+                    if (app.remappedIconPackage != null) {
+                        Text(
+                            text = "Reset App Icon",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = EmeraldBright,
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(6.dp))
+                                .clickable {
+                                    onRemapIconToApp(null)
+                                    onDismiss()
+                                }
+                                .padding(horizontal = 6.dp, vertical = 4.dp)
+                        )
+                    }
+                }
+                Spacer(modifier = Modifier.height(8.dp))
+                LazyRow(
+                    contentPadding = PaddingValues(vertical = 2.dp),
+                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                    modifier = Modifier.testTag("sheet_remap_app_icon_row")
+                ) {
+                    items(allApps, key = { "remap_${it.packageName}" }) { candidate ->
+                        val isSelected = app.remappedIconPackage == candidate.packageName
+                        Column(
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                            modifier = Modifier
+                                .width(76.dp)
+                                .clip(RoundedCornerShape(10.dp))
+                                .background(if (isSelected) EmeraldContainer else SlateSurfaceElevated)
+                                .border(
+                                    width = if (isSelected) 1.5.dp else 1.dp,
+                                    color = if (isSelected) EmeraldBright else SlateBorder,
+                                    shape = RoundedCornerShape(10.dp)
+                                )
+                                .clickable {
+                                    onRemapIconToApp(candidate.packageName)
+                                    onDismiss()
+                                }
+                                .padding(8.dp)
+                        ) {
+                            Image(
+                                bitmap = candidate.themedIconBitmap.asImageBitmap(),
+                                contentDescription = candidate.label,
+                                modifier = Modifier.size(40.dp)
+                            )
+                            Spacer(modifier = Modifier.height(4.dp))
+                            Text(
+                                text = candidate.label,
+                                style = MaterialTheme.typography.labelSmall,
+                                color = if (isSelected) EmeraldBright else TextSecondary,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                        }
+                    }
+                }
+            }
+
+            // 2. Launch Activity Selector (Within Original App Only)
+            if (appActivities.isNotEmpty()) {
+                Spacer(modifier = Modifier.height(12.dp))
+                HorizontalDivider(color = SlateBorder)
+                Spacer(modifier = Modifier.height(10.dp))
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = "Launch Activity (${app.packageName})",
+                        style = MaterialTheme.typography.titleSmall,
+                        color = TextPrimary,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f)
+                    )
+                    if (app.customActivityName != null) {
+                        Text(
+                            text = "Default Activity",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = EmeraldBright,
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(6.dp))
+                                .clickable {
+                                    onSelectCustomActivity(null)
+                                    onDismiss()
+                                }
+                                .padding(horizontal = 6.dp, vertical = 4.dp)
+                        )
+                    }
+                }
+                Spacer(modifier = Modifier.height(8.dp))
+                LazyRow(
+                    contentPadding = PaddingValues(vertical = 2.dp),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    modifier = Modifier.testTag("sheet_activity_selector_row")
+                ) {
+                    items(appActivities, key = { it.activityName }) { actOpt ->
+                        val isSelected = app.activityName == actOpt.activityName
+                        Surface(
+                            color = if (isSelected) EmeraldContainer else SlateSurfaceElevated,
+                            shape = RoundedCornerShape(10.dp),
+                            modifier = Modifier
+                                .border(
+                                    width = if (isSelected) 1.5.dp else 1.dp,
+                                    color = if (isSelected) EmeraldBright else SlateBorder,
+                                    shape = RoundedCornerShape(10.dp)
+                                )
+                                .clip(RoundedCornerShape(10.dp))
+                                .clickable {
+                                    onSelectCustomActivity(
+                                        if (actOpt.isDefaultLauncher) null else actOpt.activityName
+                                    )
+                                    onDismiss()
+                                }
+                        ) {
+                            Column(
+                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 7.dp)
+                            ) {
+                                Text(
+                                    text = actOpt.label,
+                                    style = MaterialTheme.typography.labelMedium,
+                                    color = if (isSelected) EmeraldBright else TextPrimary,
+                                    maxLines = 1
+                                )
+                                Text(
+                                    text = actOpt.activityName.substringAfterLast('.'),
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = TextSecondary,
+                                    maxLines = 1
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+
             Spacer(modifier = Modifier.height(12.dp))
+            HorizontalDivider(color = SlateBorder)
+            Spacer(modifier = Modifier.height(10.dp))
 
             Row(
                 modifier = Modifier.fillMaxWidth(),

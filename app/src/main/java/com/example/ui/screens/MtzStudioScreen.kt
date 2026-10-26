@@ -71,9 +71,12 @@ import java.util.Locale
 fun MtzStudioScreen(
     themes: List<MtzThemeEntity>,
     activeThemeId: String,
+    widgetThemeId: String = "",
     activeThemeMetadata: MtzThemeMetadata?,
+    activeWidgetThemeMetadata: MtzThemeMetadata? = activeThemeMetadata,
     activeThemeCatalog: List<CatalogIconEntry>,
     onActivateTheme: (String) -> Unit,
+    onSelectWidgetTheme: (String) -> Unit = {},
     onRequestImportMtz: () -> Unit,
     onRequestExportMtz: (MtzThemeEntity) -> Unit,
     onDeleteCustomTheme: (String) -> Unit,
@@ -81,6 +84,7 @@ fun MtzStudioScreen(
 ) {
     BackHandler(onBack = onCloseStudio)
     var showXmlSheet by remember { mutableStateOf(false) }
+    val effectiveWidgetThemeId = widgetThemeId.takeIf { it.isNotBlank() } ?: activeThemeId
 
     Column(
         modifier = Modifier
@@ -173,6 +177,17 @@ fun MtzStudioScreen(
                 .weight(1f)
                 .testTag("mtz_theme_list")
         ) {
+            // Global Widget Theme Selector (Mix Icons from Theme A + Widgets from Theme B)
+            item {
+                GlobalWidgetThemeSelectorCard(
+                    themes = themes,
+                    activeIconThemeId = activeThemeId,
+                    widgetThemeId = widgetThemeId,
+                    activeWidgetThemeMetadata = activeWidgetThemeMetadata,
+                    onSelectWidgetTheme = onSelectWidgetTheme
+                )
+            }
+
             // MTZ Icon API Compatibility Matrix
             item {
                 MtzApiFeatureMatrixCard(metadata = activeThemeMetadata)
@@ -244,14 +259,16 @@ fun MtzStudioScreen(
             // Installed / Built-In .MTZ Packages
             items(themes, key = { it.id }) { theme ->
                 val isActive = theme.id == activeThemeId
+                val isWidgetThemeActive = theme.id == effectiveWidgetThemeId
+                val isCustomWidgetOverride = widgetThemeId.isNotBlank() && widgetThemeId == theme.id
                 Surface(
-                    color = if (isActive) SlateSurfaceElevated else SlateSurface,
+                    color = if (isActive || isCustomWidgetOverride) SlateSurfaceElevated else SlateSurface,
                     shape = RoundedCornerShape(16.dp),
                     modifier = Modifier
                         .fillMaxWidth()
                         .border(
-                            width = if (isActive) 1.5.dp else 1.dp,
-                            color = if (isActive) EmeraldBright else SlateBorder,
+                            width = if (isActive || isCustomWidgetOverride) 1.5.dp else 1.dp,
+                            color = if (isActive || isCustomWidgetOverride) EmeraldBright else SlateBorder,
                             shape = RoundedCornerShape(16.dp)
                         )
                         .testTag("theme_card_${theme.id}")
@@ -263,14 +280,16 @@ fun MtzStudioScreen(
                             verticalAlignment = Alignment.Top
                         ) {
                             Column(modifier = Modifier.weight(1f)) {
-                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                ) {
                                     Text(
                                         text = theme.title,
                                         style = MaterialTheme.typography.titleLarge,
                                         color = TextPrimary
                                     )
                                     if (isActive) {
-                                        Spacer(modifier = Modifier.width(8.dp))
                                         Surface(
                                             color = EmeraldContainer,
                                             shape = RoundedCornerShape(6.dp)
@@ -281,13 +300,37 @@ fun MtzStudioScreen(
                                             ) {
                                                 Icon(
                                                     imageVector = Icons.Default.CheckCircle,
-                                                    contentDescription = "Active",
+                                                    contentDescription = "Active Icons",
                                                     tint = EmeraldBright,
                                                     modifier = Modifier.size(13.dp)
                                                 )
                                                 Spacer(modifier = Modifier.width(4.dp))
                                                 Text(
-                                                    text = "ACTIVE",
+                                                    text = "ICONS",
+                                                    style = MaterialTheme.typography.labelSmall,
+                                                    color = EmeraldBright
+                                                )
+                                            }
+                                        }
+                                    }
+                                    if (isWidgetThemeActive) {
+                                        Surface(
+                                            color = EmeraldContainer,
+                                            shape = RoundedCornerShape(6.dp)
+                                        ) {
+                                            Row(
+                                                verticalAlignment = Alignment.CenterVertically,
+                                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp)
+                                            ) {
+                                                Icon(
+                                                    imageVector = Icons.Default.CheckCircle,
+                                                    contentDescription = "Active Widgets",
+                                                    tint = EmeraldBright,
+                                                    modifier = Modifier.size(13.dp)
+                                                )
+                                                Spacer(modifier = Modifier.width(4.dp))
+                                                Text(
+                                                    text = "WIDGETS",
                                                     style = MaterialTheme.typography.labelSmall,
                                                     color = EmeraldBright
                                                 )
@@ -344,7 +387,7 @@ fun MtzStudioScreen(
 
                         Row(
                             modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.spacedBy(10.dp)
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
                         ) {
                             Button(
                                 onClick = { onActivateTheme(theme.id) },
@@ -358,9 +401,32 @@ fun MtzStudioScreen(
                                     .testTag("apply_theme_${theme.id}")
                             ) {
                                 Text(
-                                    text = if (isActive) "Currently Applied" else "Apply .MTZ Theme",
+                                    text = if (isActive) "Icons Applied" else "Apply Icons",
                                     color = if (isActive) EmeraldBright else SlateDeepBackground,
                                     fontWeight = FontWeight.Bold
+                                )
+                            }
+
+                            OutlinedButton(
+                                onClick = {
+                                    if (isCustomWidgetOverride) {
+                                        onSelectWidgetTheme("")
+                                    } else {
+                                        onSelectWidgetTheme(theme.id)
+                                    }
+                                },
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .testTag("apply_widgets_theme_${theme.id}")
+                            ) {
+                                Text(
+                                    text = when {
+                                        isCustomWidgetOverride -> "Widgets Pinned"
+                                        isWidgetThemeActive -> "Following Icons"
+                                        else -> "Use Widgets Only"
+                                    },
+                                    color = EmeraldBright,
+                                    fontWeight = FontWeight.SemiBold
                                 )
                             }
 
@@ -375,8 +441,6 @@ fun MtzStudioScreen(
                                         tint = EmeraldBright,
                                         modifier = Modifier.size(17.dp)
                                     )
-                                    Spacer(modifier = Modifier.width(6.dp))
-                                    Text("Export .MTZ", color = EmeraldBright)
                                 }
                             }
                         }
@@ -418,6 +482,122 @@ fun MtzStudioScreen(
                 if (activeThemeMetadata.rawIconRulesXml.isNotBlank()) {
                     item {
                         XmlBlockCard(title = "icons/icon_rule.xml", xml = activeThemeMetadata.rawIconRulesXml)
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun GlobalWidgetThemeSelectorCard(
+    themes: List<MtzThemeEntity>,
+    activeIconThemeId: String,
+    widgetThemeId: String,
+    activeWidgetThemeMetadata: MtzThemeMetadata?,
+    onSelectWidgetTheme: (String) -> Unit
+) {
+    val activeIconThemeTitle = themes.firstOrNull { it.id == activeIconThemeId }?.title ?: activeIconThemeId
+    val currentWidgetLabel = if (widgetThemeId.isBlank()) {
+        "Following Icon Theme ($activeIconThemeTitle)"
+    } else {
+        themes.firstOrNull { it.id == widgetThemeId }?.title ?: widgetThemeId
+    }
+    val hasClockModule = activeWidgetThemeMetadata?.clock2x4WidgetSpec != null ||
+        activeWidgetThemeMetadata?.clock3x4WidgetSpec != null
+
+    Surface(
+        color = SlateSurface,
+        shape = RoundedCornerShape(16.dp),
+        modifier = Modifier
+            .fillMaxWidth()
+            .border(1.dp, EmeraldPrimary.copy(alpha = 0.55f), RoundedCornerShape(16.dp))
+            .testTag("global_widget_theme_selector_card")
+    ) {
+        Column(modifier = Modifier.padding(14.dp)) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = "Global Widget Theme (Mix Icons & Widgets)",
+                        style = MaterialTheme.typography.titleMedium,
+                        color = EmeraldBright,
+                        fontWeight = FontWeight.Bold
+                    )
+                    Text(
+                        text = "Active Widgets: $currentWidgetLabel",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = TextSecondary
+                    )
+                }
+                Surface(
+                    color = EmeraldContainer,
+                    shape = RoundedCornerShape(6.dp)
+                ) {
+                    Text(
+                        text = if (hasClockModule) "MAML CLOCK READY" else "PALETTE + GADGETS",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = EmeraldBright,
+                        fontWeight = FontWeight.Bold,
+                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp)
+                    )
+                }
+            }
+
+            Spacer(modifier = Modifier.height(10.dp))
+
+            LazyRow(
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                contentPadding = PaddingValues(vertical = 2.dp)
+            ) {
+                item(key = "__follow_icons__") {
+                    val isSelected = widgetThemeId.isBlank()
+                    Surface(
+                        color = if (isSelected) EmeraldContainer else SlateSurfaceElevated,
+                        shape = RoundedCornerShape(10.dp),
+                        modifier = Modifier
+                            .border(
+                                width = if (isSelected) 1.5.dp else 1.dp,
+                                color = if (isSelected) EmeraldBright else SlateBorder,
+                                shape = RoundedCornerShape(10.dp)
+                            )
+                            .clickable { onSelectWidgetTheme("") }
+                            .testTag("widget_theme_chip_follow_icons")
+                    ) {
+                        Text(
+                            text = "Follow Active Icon Theme",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = if (isSelected) EmeraldBright else TextPrimary,
+                            fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Medium,
+                            modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp)
+                        )
+                    }
+                }
+
+                items(themes, key = { "widget_chip_${it.id}" }) { theme ->
+                    val isSelected = widgetThemeId == theme.id
+                    Surface(
+                        color = if (isSelected) EmeraldContainer else SlateSurfaceElevated,
+                        shape = RoundedCornerShape(10.dp),
+                        modifier = Modifier
+                            .border(
+                                width = if (isSelected) 1.5.dp else 1.dp,
+                                color = if (isSelected) EmeraldBright else SlateBorder,
+                                shape = RoundedCornerShape(10.dp)
+                            )
+                            .clickable { onSelectWidgetTheme(theme.id) }
+                            .testTag("widget_theme_chip_${theme.id}")
+                    ) {
+                        Text(
+                            text = theme.title,
+                            style = MaterialTheme.typography.labelMedium,
+                            color = if (isSelected) EmeraldBright else TextPrimary,
+                            fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Medium,
+                            modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp)
+                        )
                     }
                 }
             }

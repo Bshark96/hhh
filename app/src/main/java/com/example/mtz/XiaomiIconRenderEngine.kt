@@ -31,6 +31,7 @@ import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.pow
+import kotlin.math.roundToInt
 
 /**
  * Implements the Xiaomi MIUI / HyperOS Icon Theme Rendering API (`<IconTransform>`).
@@ -1848,15 +1849,30 @@ class XiaomiIconRenderEngine {
         canvas.scale(scaleX, scaleY)
 
         val groupSaveStack = ArrayDeque<Int>()
+        var skipGroupDepth = 0
         var drewAnyVisual = false
 
         for (layer in spec.layers) {
             when (layer.layerType) {
                 "GROUP_START" -> {
+                    if (skipGroupDepth > 0 || !isMamlLayerVisible(layer.visibilityExpression, varsMap)) {
+                        skipGroupDepth++
+                        continue
+                    }
                     val gw = evaluateMamlNumericExpression(layer.widthExpression, varsMap, spec.width.toFloat())
                     val gh = evaluateMamlNumericExpression(layer.heightExpression, varsMap, spec.height.toFloat())
-                    val gx = evaluateMamlNumericExpression(layer.xExpression, varsMap, 0f)
-                    val gy = evaluateMamlNumericExpression(layer.yExpression, varsMap, 0f)
+                    val rawGx = evaluateMamlNumericExpression(layer.xExpression, varsMap, 0f)
+                    val rawGy = evaluateMamlNumericExpression(layer.yExpression, varsMap, 0f)
+                    val gx = when {
+                        layer.alignAttr.equals("center", true) -> rawGx - gw / 2f
+                        layer.alignAttr.equals("right", true) -> rawGx - gw
+                        else -> rawGx
+                    }
+                    val gy = when {
+                        layer.alignVAttr.equals("center", true) -> rawGy - gh / 2f
+                        layer.alignVAttr.equals("bottom", true) -> rawGy - gh
+                        else -> rawGy
+                    }
                     val sc = if (layer.groupLayered) {
                         canvas.saveLayer(gx, gy, gx + gw, gy + gh, null)
                     } else {
@@ -1872,15 +1888,34 @@ class XiaomiIconRenderEngine {
                 }
 
                 "GROUP_END" -> {
-                    if (groupSaveStack.isNotEmpty()) {
+                    if (skipGroupDepth > 0) {
+                        skipGroupDepth--
+                    } else if (groupSaveStack.isNotEmpty()) {
                         canvas.restoreToCount(groupSaveStack.removeLast())
                     }
                 }
 
                 "IMAGE" -> {
-                    val srcName = layer.imageFileName ?: continue
-                    val imgFile = File(spec.directoryPath, srcName)
+                    if (skipGroupDepth > 0 || !isMamlLayerVisible(layer.visibilityExpression, varsMap)) continue
+                    val baseSrc = layer.imageFileName ?: layer.srcExp ?: continue
+                    val resolvedSrc = if (!layer.srcidExpression.isNullOrBlank()) {
+                        val idVal = evaluateMamlNumericExpression(layer.srcidExpression, varsMap, 0f).roundToInt()
+                        appendMamlSpriteSuffix(baseSrc, idVal.toString())
+                    } else {
+                        baseSrc
+                    }
+                    val imgFile = File(spec.directoryPath, resolvedSrc).takeIf { it.isFile }
+                        ?: File(spec.directoryPath, baseSrc)
                     val layerBmp = decodeBitmapCached(imgFile.absolutePath) ?: continue
+
+                    val bw = layerBmp.width.toFloat()
+                    val bh = layerBmp.height.toFloat()
+                    if (layer.name.isNotBlank()) {
+                        varsMap["#${layer.name}.bmp_width"] = bw
+                        varsMap["${layer.name}.bmp_width"] = bw
+                        varsMap["#${layer.name}.bmp_height"] = bh
+                        varsMap["${layer.name}.bmp_height"] = bh
+                    }
 
                     val x = evaluateMamlNumericExpression(layer.xExpression, varsMap, layer.centerX)
                     val y = evaluateMamlNumericExpression(layer.yExpression, varsMap, layer.centerY)
@@ -1892,8 +1927,6 @@ class XiaomiIconRenderEngine {
                         .toInt()
                         .coerceIn(0, 255)
 
-                    val bw = layerBmp.width.toFloat()
-                    val bh = layerBmp.height.toFloat()
                     val drawLeft = when {
                         layer.alignAttr.equals("center", true) -> x - bw / 2f
                         layer.alignAttr.equals("right", true) -> x - bw
@@ -1927,7 +1960,66 @@ class XiaomiIconRenderEngine {
                     drewAnyVisual = true
                 }
 
+                "IMAGE_NUMBER" -> {
+                    if (skipGroupDepth > 0 || !isMamlLayerVisible(layer.visibilityExpression, varsMap)) continue
+                    val baseSrc = layer.imageFileName ?: layer.srcExp ?: continue
+                    val numVal = evaluateMamlNumericExpression(layer.numberExpression ?: "#date", varsMap, 1f).roundToInt()
+                    val numStr = numVal.toString()
+                    val sprites = ArrayList<Bitmap>(numStr.length)
+                    for (ch in numStr) {
+                        val suffix = when (ch) {
+                            '-' -> "-"
+                            ':' -> "colon"
+                            '.' -> "dot"
+                            else -> ch.toString()
+                        }
+                        val spriteFile = File(spec.directoryPath, appendMamlSpriteSuffix(baseSrc, suffix))
+                        decodeBitmapCached(spriteFile.absolutePath)?.let { sprites.add(it) }
+                    }
+                    if (sprites.isEmpty()) continue
+
+                    val space = evaluateMamlNumericExpression(layer.spaceExpression, varsMap, 0f)
+                    var totalW = 0f
+                    var maxH = 0f
+                    sprites.forEachIndexed { idx, bmp ->
+                        totalW += bmp.width
+                        if (idx < sprites.lastIndex) totalW += space
+                        if (bmp.height > maxH) maxH = bmp.height.toFloat()
+                    }
+                    if (layer.name.isNotBlank()) {
+                        varsMap["#${layer.name}.bmp_width"] = totalW
+                        varsMap["${layer.name}.bmp_width"] = totalW
+                        varsMap["#${layer.name}.bmp_height"] = maxH
+                        varsMap["${layer.name}.bmp_height"] = maxH
+                    }
+
+                    val x = evaluateMamlNumericExpression(layer.xExpression, varsMap, layer.centerX)
+                    val y = evaluateMamlNumericExpression(layer.yExpression, varsMap, layer.centerY)
+                    val alphaVal = evaluateMamlNumericExpression(layer.alphaExpression, varsMap, layer.alpha.toFloat())
+                        .toInt()
+                        .coerceIn(0, 255)
+
+                    var cursorX = when {
+                        layer.alignAttr.equals("center", true) -> x - totalW / 2f
+                        layer.alignAttr.equals("right", true) -> x - totalW
+                        else -> x
+                    }
+                    val drawTop = when {
+                        layer.alignVAttr.equals("center", true) -> y - maxH / 2f
+                        layer.alignVAttr.equals("bottom", true) -> y - maxH
+                        else -> y
+                    }
+                    val numPaint = Paint(basePaint).apply { alpha = alphaVal }
+                    for (bmp in sprites) {
+                        val digitTop = drawTop + (maxH - bmp.height) / 2f
+                        canvas.drawBitmap(bmp, cursorX, digitTop, numPaint)
+                        cursorX += bmp.width + space
+                    }
+                    drewAnyVisual = true
+                }
+
                 "RECTANGLE" -> {
+                    if (skipGroupDepth > 0 || !isMamlLayerVisible(layer.visibilityExpression, varsMap)) continue
                     val x = evaluateMamlNumericExpression(layer.xExpression, varsMap, layer.centerX)
                     val y = evaluateMamlNumericExpression(layer.yExpression, varsMap, layer.centerY)
                     val w = evaluateMamlNumericExpression(layer.widthExpression, varsMap, 4f)
@@ -1973,6 +2065,7 @@ class XiaomiIconRenderEngine {
                 }
 
                 "DATETIME", "TEXT" -> {
+                    if (skipGroupDepth > 0 || !isMamlLayerVisible(layer.visibilityExpression, varsMap)) continue
                     val expr = layer.textExpression ?: continue
                     val textValue = evaluateMamlTextExpression(
                         expr = expr,
@@ -2034,6 +2127,25 @@ class XiaomiIconRenderEngine {
         return output
     }
 
+    private fun isMamlLayerVisible(visibilityExpr: String?, vars: Map<String, Float>): Boolean {
+        if (visibilityExpr.isNullOrBlank()) return true
+        val trimmed = visibilityExpr.trim()
+        if (trimmed.equals("true", ignoreCase = true)) return true
+        if (trimmed.equals("false", ignoreCase = true)) return false
+        return evaluateMamlNumericExpression(trimmed, vars, 1f) > 0f
+    }
+
+    private fun appendMamlSpriteSuffix(baseSrc: String, suffix: String): String {
+        val dotIdx = baseSrc.lastIndexOf('.')
+        return if (dotIdx > 0) {
+            val prefix = baseSrc.substring(0, dotIdx)
+            val ext = baseSrc.substring(dotIdx)
+            "${prefix}_$suffix$ext"
+        } else {
+            "${baseSrc}_$suffix.png"
+        }
+    }
+
     private fun resolvePorterDuffXfermode(modeName: String?): Xfermode? {
         if (modeName.isNullOrBlank()) return null
         val mode = when (modeName.trim().lowercase()) {
@@ -2060,7 +2172,7 @@ class XiaomiIconRenderEngine {
         calendar: Calendar,
         animTimeMs: Long,
         batteryLevel: Int = 85
-    ): Map<String, Float> {
+    ): MutableMap<String, Float> {
         val hour12 = (calendar.get(Calendar.HOUR) % 12).toFloat()
         val hour24 = calendar.get(Calendar.HOUR_OF_DAY).toFloat()
         val minute = calendar.get(Calendar.MINUTE).toFloat()
@@ -2070,14 +2182,17 @@ class XiaomiIconRenderEngine {
             calendar.get(Calendar.SECOND)) * 1000L +
             calendar.get(Calendar.MILLISECOND)).toFloat()
 
-        val map = HashMap<String, Float>(28)
+        val map = HashMap<String, Float>(40)
         map["#hour12"] = hour12
         map["#hour24"] = hour24
         map["#minute"] = minute
         map["#second"] = second
         map["#time_sys"] = millisInDay
+        map["#time_format"] = 1f
+        map["#ampm"] = calendar.get(Calendar.AM_PM).toFloat()
         map["#date"] = calendar.get(Calendar.DAY_OF_MONTH).toFloat()
         map["#day"] = calendar.get(Calendar.DAY_OF_MONTH).toFloat()
+        map["#day_of_week"] = calendar.get(Calendar.DAY_OF_WEEK).toFloat()
         map["#month"] = (calendar.get(Calendar.MONTH) + 1).toFloat()
         map["#year"] = calendar.get(Calendar.YEAR).toFloat()
         map["#battery_level"] = batteryLevel.toFloat()
@@ -2096,6 +2211,13 @@ class XiaomiIconRenderEngine {
             val evaluated = evaluateMamlVarAtTime(varAnim, animTimeMs)
             map["#$name"] = evaluated
             map[name] = evaluated
+        }
+        for (vDef in spec.scalarVariables) {
+            if (!vDef.isString) {
+                val evaluated = evaluateMamlNumericExpression(vDef.expression, map, 0f)
+                map["#${vDef.name}"] = evaluated
+                map[vDef.name] = evaluated
+            }
         }
         return map
     }
@@ -2165,7 +2287,7 @@ class XiaomiIconRenderEngine {
     }
 
     /**
-     * Recursive-descent arithmetic evaluator for MAML expressions (`+`, `-`, `*`, `/`, `%`, parentheses, and `#var` tokens).
+     * Recursive-descent arithmetic evaluator for MAML expressions (`+`, `-`, `*`, `/`, `%`, parentheses, functions, and `#var` tokens).
      */
     private fun evaluateMamlNumericExpression(
         expr: String?,
@@ -2249,6 +2371,10 @@ class XiaomiIconRenderEngine {
                 pos++
                 return -parseFactor()
             }
+            if (ch == '!') {
+                pos++
+                return if (parseFactor() == 0f) 1f else 0f
+            }
             if (ch == '(') {
                 pos++
                 val v = parseExpression()
@@ -2263,6 +2389,25 @@ class XiaomiIconRenderEngine {
                     pos++
                 }
                 val token = input.substring(start, pos)
+                skipWhitespace()
+                if (!token.startsWith("#") && pos < input.length && input[pos] == '(') {
+                    pos++ // consume '('
+                    val args = mutableListOf<Float>()
+                    skipWhitespace()
+                    if (pos < input.length && input[pos] != ')') {
+                        while (pos < input.length) {
+                            args.add(parseExpression())
+                            skipWhitespace()
+                            if (pos < input.length && input[pos] == ',') {
+                                pos++
+                            } else {
+                                break
+                            }
+                        }
+                    }
+                    if (pos < input.length && input[pos] == ')') pos++
+                    return evalFunc(token, args)
+                }
                 return vars[token] ?: vars["#$token"] ?: 0f
             }
             if (ch.isDigit() || ch == '.') {
@@ -2274,6 +2419,33 @@ class XiaomiIconRenderEngine {
             }
             pos++
             return 0f
+        }
+
+        private fun evalFunc(name: String, args: List<Float>): Float {
+            return when (name.lowercase()) {
+                "ifelse" -> {
+                    var i = 0
+                    while (i + 1 < args.size) {
+                        if (args[i] != 0f) return args[i + 1]
+                        i += 2
+                    }
+                    if (args.size % 2 == 1) args.last() else 0f
+                }
+                "eq" -> if (args.size >= 2 && abs(args[0] - args[1]) < 1e-4f) 1f else 0f
+                "ne" -> if (args.size >= 2 && abs(args[0] - args[1]) >= 1e-4f) 1f else 0f
+                "gt" -> if (args.size >= 2 && args[0] > args[1]) 1f else 0f
+                "ge" -> if (args.size >= 2 && args[0] >= args[1] - 1e-4f) 1f else 0f
+                "lt" -> if (args.size >= 2 && args[0] < args[1]) 1f else 0f
+                "le" -> if (args.size >= 2 && args[0] <= args[1] + 1e-4f) 1f else 0f
+                "not" -> if (args.isEmpty() || args[0] == 0f) 1f else 0f
+                "int", "floor" -> if (args.isNotEmpty()) args[0].toInt().toFloat() else 0f
+                "round" -> if (args.isNotEmpty()) args[0].roundToInt().toFloat() else 0f
+                "abs" -> if (args.isNotEmpty()) abs(args[0]) else 0f
+                "min" -> if (args.size >= 2) kotlin.math.min(args[0], args[1]) else 0f
+                "max" -> if (args.size >= 2) kotlin.math.max(args[0], args[1]) else 0f
+                "isnull" -> 0f
+                else -> 0f
+            }
         }
 
         private fun skipWhitespace() {

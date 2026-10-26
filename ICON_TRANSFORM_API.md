@@ -274,3 +274,203 @@ Standard MIUI themes without extended filters or custom ordering run through the
     </IconFilters>
 </IconTransform>
 ```
+
+---
+
+## 7. `<DockConfig>` XML Customization API — Complete Technical Data Sheet
+
+MTZLauncher includes a declarative XML Dock Customization API (`<DockConfig>`) that lets `.mtz` theme authors and users customize the bottom dock's **Layout & Geometry**, **Background** (solid, linear/vertical/diagonal gradient, or bitmap texture), **Border** (outer stroke + inner highlight rim), and **4-Side / 4-Corner Frame Images Layout** (`<SideImages>`).
+
+### 7.1 Zero-Config Stock MIUI Fallback Behavior (What happens when no `<DockConfig>` is found?)
+
+If a theme's XML files (`dock_config.xml`, `transform_config.xml`, `icon_config.xml`, `theme_values.xml`) do **not** contain a `<DockConfig>` tag (or if `<DockConfig enabled="false">` is set, or no Live Dock XML override is active):
+- `DockXmlConfig.isCustomDockEnabled` evaluates to **`false`**.
+- **Zero visual modifications are applied to the dock**: no background card/pill, no border stroke, no 4-side or 4-corner frame images, and no extra container margins are rendered.
+- The bottom dock renders as the **100% unmodified stock MIUI transparent pin bar** (`padding(horizontal = 12.dp, vertical = 2.dp)` directly over the wallpaper), identical to standard MIUI / HyperOS themes.
+
+### 7.2 Supported XML Locations & Resolution Precedence
+
+`<DockConfig>` is resolved in the following priority order:
+1. **Live Dock XML Override** (`LauncherEngineConfig.customDockXml`): Configured at runtime via **Desktop Edit Mode -> Dock XML (`<DockConfig>`) -> Live XML Editor** or **System Settings**. Clearing the Live XML immediately falls back to the active `.mtz` theme or stock MIUI dock.
+2. **Standalone `dock_config.xml`**: Located at the root of the `.mtz` archive, inside the inner `icons` ZIP, or inside the `com.miui.home` module ZIP.
+3. **Embedded inside `transform_config.xml` / `icon_config.xml`**: Placed either as a child block inside `<IconTransform> ... <DockConfig>...</DockConfig> </IconTransform>` or alongside it.
+
+---
+
+### 7.3 `<DockConfig>` & `<Layout>` Attributes Reference
+
+Attributes can be placed directly on `<DockConfig ...>` or on a nested `<Layout ... />` element:
+
+| Attribute | Type / Range | Stock Fallback (`enabled="false"`) | Default When `<DockConfig>` Present | Description |
+| :--- | :--- | :--- | :--- | :--- |
+| `enabled` | Boolean (`"true"` \| `"false"`) | `false` | `true` | Enables or disables custom dock rendering. When `"false"`, reverts to the stock MIUI transparent dock. |
+| `heightDp` (or `height`) | Float (`56..130` dp, or `0`) | `0` (Wrap) | `0` (Wrap icons) | Explicit dock height in `dp`. When `0`, wraps the dock icons plus vertical padding. |
+| `marginHorizontalDp` (or `marginH`) | Float (`0..48` dp) | `12` | `12` | Outer left/right margin of the dock container from screen edges. |
+| `marginBottomDp` (or `marginBottom`) | Float (`0..40` dp) | `2` | `6` | Outer bottom margin of the dock container. |
+| `paddingHorizontalDp` (or `paddingH`) | Float (`0..40` dp) | `0` | `14` | Inner left/right padding between the dock frame and dock icons. |
+| `paddingVerticalDp` (or `paddingV`) | Float (`0..32` dp) | `2` | `8` | Inner top/bottom padding between the dock frame and dock icons. |
+| `cornerRadiusDp` (or `radius`) | Float (`0..48` dp) | `0` | `26` | Uniform corner radius for all 4 corners (overridden per-corner if specified). |
+| `topLeftRadiusDp` | Float (`0..48` dp) | `0` | `cornerRadiusDp` | Top-left corner radius in `dp`. |
+| `topRightRadiusDp` | Float (`0..48` dp) | `0` | `cornerRadiusDp` | Top-right corner radius in `dp`. |
+| `bottomLeftRadiusDp` | Float (`0..48` dp) | `0` | `cornerRadiusDp` | Bottom-left corner radius in `dp`. |
+| `bottomRightRadiusDp` | Float (`0..48` dp) | `0` | `cornerRadiusDp` | Bottom-right corner radius in `dp`. |
+| `iconSpacingDp` | Float (`0..24` dp) | `4` | `4` | Horizontal spacing between dock icon slots. |
+
+---
+
+### 7.4 `<Background>` Element Reference
+
+Controls the dock surface fill, multi-stop gradient, opacity, and optional background texture image:
+
+| Attribute | Type / Values | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `color` | `#AARRGGBB` / `#RRGGBB` | `"#CC141B2D"` | Solid background color (when `gradientStartColor` is not specified). |
+| `gradientStartColor` (or `startColor`) | `#AARRGGBB` / `#RRGGBB` | `null` | Start color of the dock background gradient. |
+| `gradientMidColor` (or `midColor`) | `#AARRGGBB` / `#RRGGBB` | `null` | Optional middle color stop (`0.5`) of the background gradient. |
+| `gradientEndColor` (or `endColor`) | `#AARRGGBB` / `#RRGGBB` | `null` | End color of the dock background gradient. |
+| `gradientAngle` (or `angle`) | Float (`0`, `45`, `90`, `135`) | `0` | Gradient direction in degrees (`0` = Left-to-Right, `90` = Top-to-Bottom, `45` / `135` = Diagonal). |
+| `opacity` (or `alpha`) | Float (`0.0..1.0` or `0..255`) | `0.88` | Master opacity multiplier applied to the background color/gradient and background image. |
+| `image` (or `src`) | Asset path or `"builtin:..."` | `null` | Optional background texture image inside the `.mtz` archive (e.g., `"dock/dock_bg.png"`) or built-in procedural texture (`"builtin:carbon_grid"`, `"builtin:frosted_noise"`, `"builtin:gold_ornate"`). |
+| `scaleMode` (or `scale`) | `"STRETCH"` \| `"TILE"` \| `"CENTER"` \| `"FIT"` | `"STRETCH"` | How the background `image` is drawn across the dock container. |
+
+---
+
+### 7.5 `<Border>` Element Reference
+
+Controls the dock's outer stroke and optional inner glass rim highlight:
+
+| Attribute | Type / Values | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `enabled` | Boolean (`"true"` \| `"false"`) | `true` (when `<Border>` tag exists) | Enables or disables the outer border stroke. |
+| `widthDp` (or `width`) | Float (`0..12` dp) | `1.5` | Outer border stroke width in `dp`. |
+| `color` | `#AARRGGBB` / `#RRGGBB` | `"#6638BDF8"` | Solid border stroke color. |
+| `gradientStartColor` (or `startColor`) | `#AARRGGBB` / `#RRGGBB` | `null` | Optional gradient start color for the border stroke. |
+| `gradientEndColor` (or `endColor`) | `#AARRGGBB` / `#RRGGBB` | `null` | Optional gradient end color for the border stroke. |
+| `innerHighlightColor` (or `rimColor`) | `#AARRGGBB` / `#RRGGBB` | `null` | Optional 1dp inset inner highlight rim (glassmorphic specular edge). |
+
+---
+
+### 7.6 `<SideImages>` — 4-Side & 4-Corner Frame Images Layout Reference
+
+`<SideImages>` lets you attach decorative frame images, neon light bars, or 9-patch-style ornamental borders to **all 4 sides** (`<Top>`, `<Bottom>`, `<Left>`, `<Right>`, or shorthand `<AllSides>`) and **all 4 corners** (`<CornerTopLeft>`, `<CornerTopRight>`, `<CornerBottomLeft>`, `<CornerBottomRight>`, or shorthand `<Corners>`) of the dock container.
+
+#### Side Tags: `<Top>`, `<Bottom>`, `<Left>`, `<Right>`, `<AllSides>`
+- `<AllSides ... />` sets default side image properties for all 4 edges at once; individual `<Top>`, `<Bottom>`, `<Left>`, and `<Right>` tags can override any edge.
+
+| Attribute | Type / Values | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `src` (or `image`) | Asset path or `"builtin:..."` | Required | Path to PNG/WebP inside the `.mtz` archive (e.g., `"dock/top_edge.png"`) or built-in procedural frame asset (`"builtin:neon_edge"`, `"builtin:gold_trim"`, `"builtin:crystal_rail"`, `"builtin:cyber_hazard"`). |
+| `thicknessDp` (or `sizeDp`, `widthDp`, `heightDp`) | Float (`1..48` dp) | `6` | Height in `dp` for `<Top>`/`<Bottom>` edges, or width in `dp` for `<Left>`/`<Right>` edges. |
+| `offsetDp` (or `offset`) | Float (`-24..24` dp) | `0` | Outward (`> 0`) or inward (`< 0`) offset in `dp` perpendicular to that dock edge. |
+| `insetStartDp` (or `insetStart`) | Float (`0..120` dp) | `0` | Start inset in `dp` along the edge (leaves room for corner caps). |
+| `insetEndDp` (or `insetEnd`) | Float (`0..120` dp) | `0` | End inset in `dp` along the edge. |
+| `scaleMode` (or `scale`) | `"STRETCH"` \| `"TILE"` \| `"CENTER"` \| `"FIT"` | `"STRETCH"` | `"STRETCH"` scales the image along the edge; `"TILE"` repeats the pattern seamlessly along the edge; `"CENTER"` centers it without stretching. |
+| `alpha` (or `opacity`) | Float (`0.0..1.0` or `0..255`) | `1.0` | Opacity of the side image. |
+| `tint` (or `color`) | `#AARRGGBB` / `#RRGGBB` | `null` | Optional multiplicative `BlendMode.Modulate` color tint applied to the image. |
+
+#### Corner Tags: `<Corners>`, `<CornerTopLeft>`, `<CornerTopRight>`, `<CornerBottomLeft>`, `<CornerBottomRight>`
+- `<Corners ... />` applies a corner ornament to all 4 corners; individual `<CornerTopLeft>`, `<CornerTopRight>`, `<CornerBottomLeft>`, `<CornerBottomRight>` tags override specific corners.
+
+| Attribute | Type / Values | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `src` (or `image`) | Asset path or `"builtin:..."` | Required | Path to corner PNG inside `.mtz` or built-in procedural ornament (`"builtin:gold_corner"`, `"builtin:cyber_bracket"`). |
+| `sizeDp` (or `widthDp`) | Float (`4..64` dp) | `18` | Width and height of the corner ornament in `dp`. |
+| `offsetXDp` / `offsetYDp` | Float (`-24..24` dp) | `0` | Horizontal and vertical offset adjustment in `dp`. |
+| `alpha` (or `opacity`) | Float (`0.0..1.0` or `0..255`) | `1.0` | Opacity of the corner image. |
+| `tint` (or `color`) | `#AARRGGBB` / `#RRGGBB` | `null` | Optional color tint applied to the corner ornament. |
+
+---
+
+### 7.7 Copy-Pasteable `<DockConfig>` XML Examples
+
+#### Example A: Cyberpunk 4-Side Neon Frame + Corner Brackets (`dock_config.xml`)
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<DockConfig enabled="true">
+    <Layout
+        marginHorizontalDp="12"
+        marginBottomDp="8"
+        paddingHorizontalDp="14"
+        paddingVerticalDp="10"
+        cornerRadiusDp="22" />
+    <Background
+        gradientStartColor="#EE090D16"
+        gradientMidColor="#EE111827"
+        gradientEndColor="#EE090D16"
+        gradientAngle="0"
+        opacity="0.95"
+        image="builtin:carbon_grid"
+        scaleMode="TILE" />
+    <Border
+        enabled="true"
+        widthDp="1.5"
+        gradientStartColor="#FF00F5D4"
+        gradientEndColor="#FFFF2A85"
+        innerHighlightColor="#4400F5D4" />
+    <SideImages>
+        <Top src="builtin:neon_edge" thicknessDp="6" offsetDp="0" insetStartDp="16" insetEndDp="16" scaleMode="STRETCH" tint="#FF00F5D4" />
+        <Bottom src="builtin:neon_edge" thicknessDp="6" offsetDp="0" insetStartDp="16" insetEndDp="16" scaleMode="STRETCH" tint="#FFFF2A85" />
+        <Left src="builtin:neon_edge" thicknessDp="6" offsetDp="0" insetStartDp="12" insetEndDp="12" scaleMode="STRETCH" tint="#FF00F5D4" />
+        <Right src="builtin:neon_edge" thicknessDp="6" offsetDp="0" insetStartDp="12" insetEndDp="12" scaleMode="STRETCH" tint="#FFFF2A85" />
+        <Corners src="builtin:cyber_bracket" sizeDp="18" alpha="0.95" tint="#FF38BDF8" />
+    </SideImages>
+</DockConfig>
+```
+
+#### Example B: Royal Gold Ornate 4-Side Tiled Trim + Gold Corner Caps (Embedded in `transform_config.xml`)
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<IconTransform>
+    <IconFilters>
+        <Filter name="GrayScale" BlackColor="#1E293B" WhiteColor="#F8FAFC" />
+    </IconFilters>
+
+    <DockConfig enabled="true" cornerRadiusDp="24" marginHorizontalDp="14" marginBottomDp="8" paddingHorizontalDp="16" paddingVerticalDp="10">
+        <Background
+            gradientStartColor="#F01C160B"
+            gradientMidColor="#F02D2210"
+            gradientEndColor="#F0181208"
+            gradientAngle="90"
+            opacity="0.94" />
+        <Border
+            enabled="true"
+            widthDp="2.0"
+            gradientStartColor="#FFFDE047"
+            gradientEndColor="#FFB45309"
+            innerHighlightColor="#55FEF08A" />
+        <SideImages>
+            <AllSides
+                src="builtin:gold_trim"
+                thicknessDp="7"
+                insetStartDp="14"
+                insetEndDp="14"
+                scaleMode="TILE"
+                alpha="0.95" />
+            <Corners
+                src="builtin:gold_corner"
+                sizeDp="20"
+                alpha="1.0" />
+        </SideImages>
+    </DockConfig>
+</IconTransform>
+```
+
+---
+
+## 8. How Xiaomi MIUI Theme Widgets Work & How MTZLauncher Bridges Them
+
+### 8.1 How Real Xiaomi `.mtz` Custom Widgets Work Internally
+In stock Xiaomi MIUI / HyperOS themes, custom desktop widgets (`clock_2x4`, `weather_4x4`, `calendar`) are packaged inside the `.mtz` ZIP archive as **MAML (MIUI Application Markup Language)** modules containing a `manifest.xml` and sliced PNG sprite layers:
+1. **`<VariableBinders>` (`ContentProviderBinder`)**: MAML widgets do not fetch network weather or read calendar SQLite tables directly. Instead, `manifest.xml` declares `<ContentProviderBinder>` blocks that query Xiaomi system providers (`content://weather/weather`, `content://com.android.calendar/instances/when`) and bind columns into MAML variables (`@weather_location`, `#weather_temperature`, `@weather_description`, `#weather_id`, `@calendar_title`).
+2. **`<IntentCommand>`**: Tapping regions of the MAML widget executes `<IntentCommand action="..." package="..." />` to open the system Clock, Weather, or Calendar app.
+
+### 8.2 How MTZLauncher Bridges MIUI Widgets & Native Android Widgets
+1. **Native Android System Widgets (`AppWidgetHost` / `AppWidgetManager`)**:
+   - Bound via `LauncherAppWidgetHost` (`hostId = 1024`) and `LauncherAppWidgetHostView`.
+   - Supports `ACTION_APPWIDGET_BIND` and automatic `ACTION_APPWIDGET_CONFIGURE` activity launching when `AppWidgetProviderInfo.configure != null`.
+   - Normal taps and vertical scrolling inside `RemoteViews` pass directly to the native widget; long-pressing anywhere on the widget enters the MIUI 4-corner cyan resize & drag overlay.
+2. **MIUI Theme Widgets Bridged with Native Apps**:
+   - **MIUI 2x4 Flip Clock & Weather Bridge (`MIUI_CLOCK_WEATHER_2X4`)**: Renders `.mtz` theme clock hands/dials or MIUI flip-clock digits alongside live GPS/network weather. Tapping the clock side launches the device's **native Clock/Alarm app** (`AlarmClock.ACTION_SHOW_ALARMS`); tapping the weather side launches the **native Weather app or forecast**.
+   - **MIUI Weather MAML Bridge (`MIUI_WEATHER_BRIDGE`)**: Queries `LocationManager` + `Geocoder` for the user's real locality and feeds live `@weather_location`, `#weather_temperature`, `@weather_description`, and 3-day forecast variables into the widget.
+   - **MIUI Calendar Agenda Bridge (`MIUI_CALENDAR_BRIDGE`)**: Queries `CalendarContract.Instances` (`READ_CALENDAR`) for real upcoming user events and launches the **native Calendar app** (`content://com.android.calendar/time/<epochMillis>`) when tapped.
+

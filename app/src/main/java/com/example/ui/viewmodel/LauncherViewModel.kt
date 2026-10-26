@@ -9,18 +9,23 @@ import androidx.lifecycle.viewModelScope
 import com.example.data.local.LauncherDatabase
 import com.example.data.local.MtzThemeEntity
 import com.example.data.repository.LauncherRepository
+import com.example.domain.model.AppActivityOption
 import com.example.domain.model.DeviceTelemetrySnapshot
+import com.example.domain.model.DockXmlConfig
 import com.example.domain.model.HyperFolderLayoutMode
 import com.example.domain.model.HyperWidgetType
 import com.example.domain.model.IconPipelineBreakdown
 import com.example.domain.model.IconResolutionSource
 import com.example.domain.model.InstalledAppItem
 import com.example.domain.model.LauncherEngineConfig
+import com.example.domain.model.MiuiBackgroundBlurMode
+import com.example.domain.model.MiuiFolderAnimationMode
 import com.example.domain.model.MiuiPageTransitionEffect
 import com.example.domain.model.MtzThemeMetadata
 import com.example.domain.model.SystemWidgetProviderItem
 import com.example.domain.model.WorkspaceFolder
 import com.example.domain.model.WorkspaceWidgetItem
+import com.example.service.LauncherNotificationListenerService
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -53,6 +58,8 @@ data class LauncherUiState(
     val engineConfig: LauncherEngineConfig = LauncherEngineConfig(),
     val installedThemes: List<MtzThemeEntity> = emptyList(),
     val activeThemeMetadata: MtzThemeMetadata? = null,
+    val activeWidgetThemeMetadata: MtzThemeMetadata? = null,
+    val effectiveDockConfig: DockXmlConfig = DockXmlConfig(),
     val activeWallpaperBitmap: Bitmap? = null,
     val allApps: List<InstalledAppItem> = emptyList(),
     val workspaceApps: List<InstalledAppItem> = emptyList(),
@@ -64,8 +71,11 @@ data class LauncherUiState(
     val drawerSearchQuery: String = "",
     val drawerSourceFilter: IconResolutionSource? = null,
     val inspectedApp: InstalledAppItem? = null,
+    val inspectedAppActivities: List<AppActivityOption> = emptyList(),
     val pipelineBreakdown: IconPipelineBreakdown? = null,
     val activeThemeIconCatalog: List<CatalogIconEntry> = emptyList(),
+    val activeNotificationPackages: Set<String> = emptySet(),
+    val activeNotificationCounts: Map<String, Int> = emptyMap(),
     val statusBannerMessage: String? = null
 )
 
@@ -94,6 +104,18 @@ class LauncherViewModel(
 
             // Start Room reactive observer
             observeLauncherData()
+
+            // Observe active notification packages and counts from LauncherNotificationListenerService
+            launch {
+                LauncherNotificationListenerService.activePackages.collectLatest { activePkgs ->
+                    _uiState.update { it.copy(activeNotificationPackages = activePkgs) }
+                }
+            }
+            launch {
+                LauncherNotificationListenerService.activeNotificationCounts.collectLatest { counts ->
+                    _uiState.update { it.copy(activeNotificationCounts = counts) }
+                }
+            }
 
             // Extract remaining built-in .mtz themes in background without delaying startup
             launch(Dispatchers.IO) {
@@ -196,6 +218,13 @@ class LauncherViewModel(
         widgetEntities: List<com.example.data.local.WorkspaceWidgetEntity>
     ) {
         val activeThemeMeta = repository.getThemeMetadata(config.activeThemeId)
+        val effectiveWidgetThemeId = config.widgetThemeId.takeIf { it.isNotBlank() } ?: config.activeThemeId
+        val activeWidgetThemeMeta = if (effectiveWidgetThemeId == config.activeThemeId) {
+            activeThemeMeta
+        } else {
+            runCatching { repository.getThemeMetadata(effectiveWidgetThemeId) }.getOrNull() ?: activeThemeMeta
+        }
+        val effectiveDock = repository.resolveEffectiveDockConfig(activeThemeMeta, config)
         val wallpaperBmp = repository.getThemeWallpaperBitmap(activeThemeMeta)
         val catalog = repository.getThemeIconCatalog(activeThemeMeta)
 
@@ -234,6 +263,11 @@ class LauncherViewModel(
         } else {
             null
         }
+        val activities = if (targetInspectApp != null) {
+            repository.queryAppActivities(targetInspectApp.packageName, targetInspectApp.defaultActivityName)
+        } else {
+            emptyList()
+        }
 
         _uiState.update { state ->
             state.copy(
@@ -242,6 +276,8 @@ class LauncherViewModel(
                 engineConfig = config,
                 installedThemes = themes,
                 activeThemeMetadata = activeThemeMeta,
+                activeWidgetThemeMetadata = activeWidgetThemeMeta,
+                effectiveDockConfig = effectiveDock,
                 activeWallpaperBitmap = wallpaperBmp,
                 allApps = apps,
                 workspaceApps = resolvedWorkspaceList,
@@ -250,6 +286,7 @@ class LauncherViewModel(
                 workspaceWidgets = resolvedWidgets,
                 deviceTelemetry = telemetry,
                 inspectedApp = targetInspectApp,
+                inspectedAppActivities = activities,
                 pipelineBreakdown = breakdown,
                 activeThemeIconCatalog = catalog
             )
@@ -601,9 +638,11 @@ class LauncherViewModel(
             val theme = _uiState.value.activeThemeMetadata ?: return@launch
             val config = _uiState.value.engineConfig
             val breakdown = repository.buildInspectorBreakdown(app, theme, config)
+            val activities = repository.queryAppActivities(app.packageName, app.defaultActivityName)
             _uiState.update { state ->
                 state.copy(
                     inspectedApp = app,
+                    inspectedAppActivities = activities,
                     pipelineBreakdown = breakdown,
                     currentTab = if (switchToTab) LauncherTab.API_PIPELINE else state.currentTab
                 )
@@ -680,12 +719,67 @@ class LauncherViewModel(
             val themeId = _uiState.value.engineConfig.activeThemeId
             repository.setPerAppIconOverride(packageName, themeId, assetKey)
             recomputeStateSnapshot(overrideConfig = null)
-            val msg = if (assetKey == null) {
-                "Reset icon for $packageName to automatic Xiaomi API resolution."
-            } else {
-                "Mapped $packageName to '$assetKey.png' from active .mtz archive."
+            val msg = when {
+                assetKey == null -> "Reset icon for $packageName to automatic Xiaomi API resolution."
+                assetKey.startsWith("app:") -> "Remapped icon for $packageName to ${assetKey.removePrefix("app:")}."
+                else -> "Mapped $packageName to '$assetKey.png' from active .mtz archive."
             }
             postStatusMessage(msg)
+        }
+    }
+
+    fun remapAppIconToPackage(targetPackageName: String, sourceAppPackageName: String?) {
+        val assetKey = sourceAppPackageName?.takeIf { it.isNotBlank() }?.let { "app:$it" }
+        setAppIconOverride(targetPackageName, assetKey)
+    }
+
+    suspend fun queryAppActivities(app: InstalledAppItem): List<AppActivityOption> {
+        return repository.queryAppActivities(app.packageName, app.defaultActivityName)
+    }
+
+    fun setAppCustomLaunchActivity(packageName: String, customActivityName: String?) {
+        viewModelScope.launch {
+            val themeId = _uiState.value.engineConfig.activeThemeId
+            repository.setPerAppCustomActivity(packageName, themeId, customActivityName)
+            recomputeStateSnapshot(overrideConfig = null)
+            val msg = if (customActivityName.isNullOrBlank()) {
+                "Restored default launch activity for $packageName."
+            } else {
+                "Set launch activity for $packageName to ${customActivityName.substringAfterLast('.')}."
+            }
+            postStatusMessage(msg)
+        }
+    }
+
+    fun toggleMtzWidgetStyling(enabled: Boolean) {
+        val label = if (enabled) "ENABLED" else "OFF (Standard Glass)"
+        mutateEngineConfigImmediate(
+            statusMessage = "MTZ Theme Visual Styling for MIUI Widgets: $label"
+        ) {
+            it.copy(enableMtzWidgetStyling = enabled)
+        }
+    }
+
+    fun setWidgetTheme(themeId: String) {
+        val cleanId = themeId.trim()
+        val label = if (cleanId.isEmpty()) {
+            "Follow Active Icon Theme"
+        } else {
+            _uiState.value.installedThemes.firstOrNull { it.id == cleanId }?.title ?: cleanId
+        }
+        mutateEngineConfigImmediate(
+            statusMessage = "Global Widget Theme: $label"
+        ) {
+            it.copy(widgetThemeId = cleanId)
+        }
+    }
+
+    fun toggleWorkspaceNotificationDots(enabled: Boolean) {
+        val label = if (enabled) "ENABLED" else "HIDDEN"
+        mutateEngineConfigImmediate(
+            statusMessage = "Workspace & Dock Notification Dots: $label"
+        ) {
+            it.copy(enableWorkspaceNotificationDots = enabled)
         }
     }
 
@@ -791,6 +885,62 @@ class LauncherViewModel(
     fun toggleShowApiSourceBadges(show: Boolean) {
         mutateEngineConfigImmediate {
             it.copy(showApiSourceBadges = show)
+        }
+    }
+
+    fun updateOverlayShadeAlpha(alpha: Float) {
+        mutateEngineConfigImmediate {
+            it.copy(overlayShadeAlpha = alpha.coerceIn(0.0f, 0.95f))
+        }
+    }
+
+    fun updateBackgroundBlurMode(mode: MiuiBackgroundBlurMode) {
+        mutateEngineConfigImmediate(
+            statusMessage = "Background blur: ${mode.displayName}"
+        ) {
+            it.copy(backgroundBlurMode = mode)
+        }
+    }
+
+    fun updateFolderAnimationMode(mode: MiuiFolderAnimationMode) {
+        mutateEngineConfigImmediate(
+            statusMessage = "Folder open animation: ${mode.displayName}"
+        ) {
+            it.copy(folderAnimationMode = mode)
+        }
+    }
+
+    fun updateCustomDockXml(xml: String) {
+        val trimmed = xml.trim()
+        val msg = if (trimmed.isEmpty()) {
+            "Restored Dock to theme default / stock MIUI transparent bar."
+        } else {
+            "Applied custom <DockConfig> XML to Home Dock."
+        }
+        mutateEngineConfigImmediate(statusMessage = msg) {
+            it.copy(customDockXml = trimmed)
+        }
+    }
+
+    fun launchClockApp() {
+        val ok = repository.launchNativeClockApp()
+        if (!ok) {
+            postStatusMessage("Opened MIUI Clock bridge (no external Clock app found on emulator).")
+        }
+    }
+
+    fun launchCalendarApp(epochMillis: Long = System.currentTimeMillis()) {
+        val ok = repository.launchNativeCalendarApp(epochMillis)
+        if (!ok) {
+            postStatusMessage("Opened MIUI Calendar bridge (no external Calendar app found on emulator).")
+        }
+    }
+
+    fun launchWeatherApp() {
+        val city = _uiState.value.deviceTelemetry.weatherCity
+        val ok = repository.launchNativeWeatherOrForecast(city)
+        if (!ok) {
+            postStatusMessage("Opened MIUI Weather bridge for $city.")
         }
     }
 

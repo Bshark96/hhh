@@ -1,5 +1,7 @@
 package com.example
 
+import android.Manifest
+import android.app.Activity
 import android.app.role.RoleManager
 import android.appwidget.AppWidgetHost
 import android.appwidget.AppWidgetManager
@@ -21,6 +23,9 @@ import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.animateDpAsState
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -39,6 +44,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Apps
@@ -67,11 +73,14 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.blur
 import androidx.compose.ui.zIndex
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
@@ -82,10 +91,12 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import com.example.data.local.MtzThemeEntity
 import com.example.domain.model.HyperFolderLayoutMode
 import com.example.domain.model.InstalledAppItem
+import com.example.domain.model.MiuiFolderAnimationMode
 import com.example.domain.model.SystemWidgetProviderItem
 import com.example.domain.model.WorkspaceFolder
 import com.example.ui.components.AppActionBottomSheet
 import com.example.ui.components.ExpandedHyperFolderSheet
+import com.example.ui.components.LauncherAppWidgetHost
 import com.example.ui.components.WidgetsAndFoldersPickerSheet
 import com.example.ui.screens.ApiPipelineScreen
 import com.example.ui.screens.AppDrawerScreen
@@ -107,7 +118,7 @@ import kotlinx.coroutines.delay
 
 class MainActivity : ComponentActivity() {
 
-    private var appWidgetHost: AppWidgetHost? = null
+    private var appWidgetHost: LauncherAppWidgetHost? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -119,7 +130,7 @@ class MainActivity : ComponentActivity() {
             window.isNavigationBarContrastEnforced = false
         }
         appWidgetHost = try {
-            AppWidgetHost(applicationContext, 1024).also { it.startListening() }
+            LauncherAppWidgetHost(applicationContext, 1024).also { it.startListening() }
         } catch (_: Exception) {
             null
         }
@@ -135,6 +146,14 @@ class MainActivity : ComponentActivity() {
                     appWidgetHost = appWidgetHost
                 )
             }
+        }
+    }
+
+    override fun onStart() {
+        super.onStart()
+        try {
+            appWidgetHost?.startListening()
+        } catch (_: Exception) {
         }
     }
 
@@ -172,16 +191,36 @@ fun HyperMtzLauncherRoot(
 
     var selectedAppForSheet by remember { mutableStateOf<InstalledAppItem?>(null) }
     var expandedFolderId by remember { mutableStateOf<String?>(null) }
+    var expandedFolderSourceBounds by remember { mutableStateOf<Rect?>(null) }
     var showWidgetsAndFoldersPicker by remember { mutableStateOf(false) }
     var activeWorkspacePage by remember { mutableIntStateOf(0) }
     var pendingExportTheme by remember { mutableStateOf<MtzThemeEntity?>(null) }
     var pendingBindWidget by remember { mutableStateOf<Pair<Int, SystemWidgetProviderItem>?>(null) }
+    var pendingConfigureWidget by remember { mutableStateOf<Pair<Int, SystemWidgetProviderItem>?>(null) }
 
     LaunchedEffect(uiState.statusBannerMessage) {
         if (uiState.statusBannerMessage != null) {
             delay(3200L)
             viewModel.dismissStatusBanner()
         }
+    }
+
+    // Runtime permission launcher for MIUI Weather (Location) & Calendar widgets
+    val widgetPermissionsLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestMultiplePermissions()
+    ) { _ ->
+        viewModel.refreshTelemetry()
+    }
+
+    val requestWidgetPermissions: () -> Unit = {
+        widgetPermissionsLauncher.launch(
+            arrayOf(
+                Manifest.permission.ACCESS_FINE_LOCATION,
+                Manifest.permission.ACCESS_COARSE_LOCATION,
+                Manifest.permission.READ_CALENDAR,
+                Manifest.permission.WRITE_CALENDAR
+            )
+        )
     }
 
     // Cross-screen drag state for dragging apps from the App Drawer or Open Folder onto the Workspace
@@ -271,20 +310,67 @@ fun HyperMtzLauncherRoot(
         pendingExportTheme = null
     }
 
+    // Native Android AppWidget Configure Activity launcher (when providerInfo.configure != null)
+    val configureAppWidgetLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        val pending = pendingConfigureWidget
+        if (pending != null) {
+            if (result.resultCode == Activity.RESULT_OK || result.resultCode == Activity.RESULT_CANCELED) {
+                viewModel.addNativeSystemWidget(
+                    appWidgetId = pending.first,
+                    providerComponent = pending.second.providerComponent,
+                    label = pending.second.label,
+                    pageIndex = activeWorkspacePage,
+                    minWidthDp = pending.second.minWidthDp,
+                    minHeightDp = pending.second.minHeightDp
+                )
+            }
+            pendingConfigureWidget = null
+        }
+    }
+
+    val finalizeBoundSystemWidget: (Int, SystemWidgetProviderItem) -> Unit = { appWidgetId, provider ->
+        try {
+            val appWidgetManager = AppWidgetManager.getInstance(context)
+            val info = if (appWidgetId >= 0) appWidgetManager.getAppWidgetInfo(appWidgetId) else null
+            val configureComponent = info?.configure
+            if (configureComponent != null && appWidgetId >= 0) {
+                pendingConfigureWidget = appWidgetId to provider
+                val configIntent = Intent(AppWidgetManager.ACTION_APPWIDGET_CONFIGURE).apply {
+                    component = configureComponent
+                    putExtra(AppWidgetManager.EXTRA_APPWIDGET_ID, appWidgetId)
+                }
+                configureAppWidgetLauncher.launch(configIntent)
+            } else {
+                viewModel.addNativeSystemWidget(
+                    appWidgetId = appWidgetId,
+                    providerComponent = provider.providerComponent,
+                    label = provider.label,
+                    pageIndex = activeWorkspacePage,
+                    minWidthDp = provider.minWidthDp,
+                    minHeightDp = provider.minHeightDp
+                )
+            }
+        } catch (_: Exception) {
+            viewModel.addNativeSystemWidget(
+                appWidgetId = appWidgetId,
+                providerComponent = provider.providerComponent,
+                label = provider.label,
+                pageIndex = activeWorkspacePage,
+                minWidthDp = provider.minWidthDp,
+                minHeightDp = provider.minHeightDp
+            )
+        }
+    }
+
     // Native Android AppWidget Bind permission launcher
     val bindAppWidgetLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.StartActivityForResult()
     ) { _ ->
         val pending = pendingBindWidget
         if (pending != null) {
-            viewModel.addNativeSystemWidget(
-                appWidgetId = pending.first,
-                providerComponent = pending.second.providerComponent,
-                label = pending.second.label,
-                pageIndex = activeWorkspacePage,
-                minWidthDp = pending.second.minWidthDp,
-                minHeightDp = pending.second.minHeightDp
-            )
+            finalizeBoundSystemWidget(pending.first, pending.second)
             pendingBindWidget = null
         }
     }
@@ -297,14 +383,7 @@ fun HyperMtzLauncherRoot(
             if (comp != null && allocatedId >= 0) {
                 val bound = appWidgetManager.bindAppWidgetIdIfAllowed(allocatedId, comp)
                 if (bound) {
-                    viewModel.addNativeSystemWidget(
-                        appWidgetId = allocatedId,
-                        providerComponent = provider.providerComponent,
-                        label = provider.label,
-                        pageIndex = activeWorkspacePage,
-                        minWidthDp = provider.minWidthDp,
-                        minHeightDp = provider.minHeightDp
-                    )
+                    finalizeBoundSystemWidget(allocatedId, provider)
                 } else {
                     pendingBindWidget = allocatedId to provider
                     val bindIntent = Intent(AppWidgetManager.ACTION_APPWIDGET_BIND).apply {
@@ -379,12 +458,39 @@ fun HyperMtzLauncherRoot(
         val wpBitmap = uiState.activeWallpaperBitmap
         val showWallpaperBackdrop =
             uiState.currentTab == LauncherTab.WORKSPACE || uiState.currentTab == LauncherTab.APP_DRAWER
+        val isDrawerOrFolderOverlayOpen =
+            (uiState.currentTab == LauncherTab.APP_DRAWER || expandedFolderId != null) && externalDraggedApp == null
+        val targetBlurDp by animateDpAsState(
+            targetValue = if (isDrawerOrFolderOverlayOpen) {
+                uiState.engineConfig.backgroundBlurMode.blurDp.dp
+            } else {
+                0.dp
+            },
+            animationSpec = tween(durationMillis = 220),
+            label = "backgroundBlurDp"
+        )
+        val workspaceZoomBackScale by animateFloatAsState(
+            targetValue = if (
+                expandedFolderId != null &&
+                externalDraggedApp == null &&
+                uiState.engineConfig.folderAnimationMode == MiuiFolderAnimationMode.MIUI_ZOOM_EXPAND
+            ) {
+                0.93f
+            } else {
+                1f
+            },
+            animationSpec = tween(durationMillis = 240),
+            label = "workspaceZoomBackScale"
+        )
+
         if (showWallpaperBackdrop && wpBitmap != null) {
             Image(
                 bitmap = wpBitmap.asImageBitmap(),
                 contentDescription = "Active MTZ Wallpaper",
                 contentScale = ContentScale.Crop,
-                modifier = Modifier.fillMaxSize()
+                modifier = Modifier
+                    .fillMaxSize()
+                    .then(if (targetBlurDp > 0.dp) Modifier.blur(targetBlurDp) else Modifier)
             )
             Box(
                 modifier = Modifier
@@ -402,7 +508,7 @@ fun HyperMtzLauncherRoot(
         }
 
         Scaffold(
-            contentWindowInsets = WindowInsets.safeDrawing,
+            contentWindowInsets = WindowInsets(0, 0, 0, 0),
             containerColor = if (showWallpaperBackdrop) {
                 Color.Transparent
             } else {
@@ -417,7 +523,9 @@ fun HyperMtzLauncherRoot(
                 if (uiState.isLoading) {
                     Box(
                         contentAlignment = Alignment.Center,
-                        modifier = Modifier.fillMaxSize()
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .windowInsetsPadding(WindowInsets.safeDrawing)
                     ) {
                         CircularProgressIndicator(color = EmeraldBright)
                     }
@@ -425,105 +533,148 @@ fun HyperMtzLauncherRoot(
                     when (uiState.currentTab) {
                         LauncherTab.WORKSPACE, LauncherTab.APP_DRAWER -> {
                             Box(modifier = Modifier.fillMaxSize()) {
-                                WorkspaceScreen(
-                                    activeTheme = uiState.activeThemeMetadata,
-                                    wallpaperBitmap = uiState.activeWallpaperBitmap,
-                                    engineConfig = uiState.engineConfig,
-                                    allApps = uiState.allApps,
-                                    workspaceApps = uiState.workspaceApps,
-                                    dockApps = uiState.dockApps,
-                                    workspaceFolders = uiState.workspaceFolders,
-                                    workspaceWidgets = uiState.workspaceWidgets,
-                                    deviceTelemetry = uiState.deviceTelemetry,
-                                    appWidgetHost = appWidgetHost,
-                                    onAppClick = { viewModel.launchInstalledApp(it) },
-                                    onAppLongClick = { selectedAppForSheet = it },
-                                    onDeleteAppShortcut = { app ->
-                                        viewModel.removeAppFromWorkspace(app.packageName)
-                                    },
-                                    onUninstallApp = handleUninstallApp,
-                                    onShareApp = handleShareApp,
-                                    onOpenAppInfo = handleOpenAppInfo,
-                                    onExpandFolder = { folder -> expandedFolderId = folder.id },
-                                    onCycleFolderMode = { folder ->
-                                        val modes = listOf(
-                                            HyperFolderLayoutMode.REGULAR_1X1,
-                                            HyperFolderLayoutMode.CAPSULE_2X1,
-                                            HyperFolderLayoutMode.TALL_1X2,
-                                            HyperFolderLayoutMode.BIG_FOLDER_2X2
-                                        )
-                                        val nextIdx = (modes.indexOf(folder.layoutMode) + 1) % modes.size
-                                        viewModel.updateFolderLayoutMode(folder.id, modes[nextIdx])
-                                    },
-                                    onResizeFolderSpan = viewModel::resizeFolderSpan,
-                                    onCycleFolderBackgroundColor = viewModel::cycleFolderBackgroundColor,
-                                    onRenameFolder = viewModel::renameFolder,
-                                    onDeleteFolder = viewModel::deleteFolder,
-                                    onMoveFolderOnWorkspace = viewModel::moveFolderOnWorkspace,
-                                    onMoveWidgetOnWorkspace = viewModel::moveWidgetOnWorkspace,
-                                    onResizeWidgetSpan = viewModel::resizeWidgetSpan,
-                                    onCycleWidgetSize = viewModel::cycleWidgetSize,
-                                    onMoveAppOnWorkspace = viewModel::moveAppOnWorkspace,
-                                    onExtractAppFromFolder = { folderId, app, page, order, isDock, cellX, cellY ->
-                                        viewModel.extractAppFromFolderToWorkspace(
-                                            folderId = folderId,
-                                            app = app,
-                                            targetPage = page,
-                                            targetSortOrder = order,
-                                            isDockItem = isDock,
-                                            preferredCellX = cellX,
-                                            preferredCellY = cellY
-                                        )
-                                    },
-                                    onSwapWorkspaceApps = viewModel::swapWorkspaceApps,
-                                    onMergeAppsIntoNewFolder = { draggedApp, targetApp, pageIndex, sourceFolderId ->
-                                        viewModel.mergeAppsIntoNewFolder(
-                                            draggedApp = draggedApp,
-                                            targetApp = targetApp,
-                                            pageIndex = pageIndex,
-                                            sourceFolderId = sourceFolderId
-                                        )
-                                    },
-                                    onMoveAppIntoFolder = { folderId, app, sourceFolderId ->
-                                        viewModel.moveAppIntoFolder(
-                                            folderId = folderId,
-                                            app = app,
-                                            sourceFolderId = sourceFolderId
-                                        )
-                                    },
-                                    onBatchMoveAppsToPage = viewModel::batchMoveAppsToPage,
-                                    onAlignWorkspacePage = viewModel::alignWorkspacePage,
-                                    onSetDefaultHomePage = viewModel::setDefaultHomePageIndex,
-                                    onUpdatePageTransitionEffect = viewModel::updatePageTransitionEffect,
-                                    onOpenWidgetsAndFoldersPicker = { showWidgetsAndFoldersPicker = true },
-                                    onActivePageChanged = { activeWorkspacePage = it },
-                                    onRefreshTelemetry = viewModel::refreshTelemetry,
-                                    onRemoveWidget = viewModel::removeWidget,
-                                    onOpenAppDrawer = { viewModel.selectTab(LauncherTab.APP_DRAWER) },
-                                    onOpenMtzStudio = { viewModel.selectTab(LauncherTab.MTZ_STUDIO) },
-                                    onOpenApiPipeline = { viewModel.selectTab(LauncherTab.API_PIPELINE) },
-                                    onOpenSettings = { viewModel.selectTab(LauncherTab.SETTINGS) },
-                                    onUpdateGridColumns = viewModel::updateGridColumns,
-                                    onUpdateGridRows = viewModel::updateGridRows,
-                                    onUpdateIconSizeDp = viewModel::updateIconSizeDp,
-                                    onToggleShowLabels = viewModel::toggleShowAppLabels,
-                                    onSetDefaultHomeLauncher = triggerDefaultHomeSelection,
-                                    onPickCustomWallpaper = {
-                                        wallpaperPickerLauncher.launch(
-                                            PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
-                                        )
-                                    },
-                                    onResetToThemeWallpaper = {
-                                        viewModel.setCustomWallpaper(null)
-                                    },
-                                    externalDraggedApp = externalDraggedApp,
-                                    externalDragSourceFolderId = externalDragSourceFolderId,
-                                    externalDragOffsetInRoot = externalDragOffsetInRoot,
-                                    onRegisterExternalDropHandler = { handler ->
-                                        workspaceExternalDropHandler = handler
-                                    }
-                                )
+                                // Workspace layer sits inside safeDrawing insets and blurs/scales smoothly when Drawer or Folder opens
+                                Box(
+                                    modifier = Modifier
+                                        .fillMaxSize()
+                                        .windowInsetsPadding(WindowInsets.safeDrawing)
+                                        .graphicsLayer {
+                                            scaleX = workspaceZoomBackScale
+                                            scaleY = workspaceZoomBackScale
+                                        }
+                                        .then(if (targetBlurDp > 0.dp) Modifier.blur(targetBlurDp) else Modifier)
+                                ) {
+                                    WorkspaceScreen(
+                                        activeTheme = uiState.activeThemeMetadata,
+                                        activeWidgetTheme = uiState.activeWidgetThemeMetadata,
+                                        wallpaperBitmap = uiState.activeWallpaperBitmap,
+                                        engineConfig = uiState.engineConfig,
+                                        effectiveDockConfig = uiState.effectiveDockConfig,
+                                        allApps = uiState.allApps,
+                                        workspaceApps = uiState.workspaceApps,
+                                        dockApps = uiState.dockApps,
+                                        workspaceFolders = uiState.workspaceFolders,
+                                        workspaceWidgets = uiState.workspaceWidgets,
+                                        deviceTelemetry = uiState.deviceTelemetry,
+                                        appWidgetHost = appWidgetHost,
+                                        onAppClick = { viewModel.launchInstalledApp(it) },
+                                        onAppLongClick = { selectedAppForSheet = it },
+                                        onDeleteAppShortcut = { app ->
+                                            viewModel.removeAppFromWorkspace(app.packageName)
+                                        },
+                                        onUninstallApp = handleUninstallApp,
+                                        onShareApp = handleShareApp,
+                                        onOpenAppInfo = handleOpenAppInfo,
+                                        onExpandFolder = { folder ->
+                                            expandedFolderSourceBounds = null
+                                            expandedFolderId = folder.id
+                                        },
+                                        onExpandFolderWithBounds = { folder, bounds ->
+                                            expandedFolderSourceBounds = bounds
+                                            expandedFolderId = folder.id
+                                        },
+                                        onCycleFolderMode = { folder ->
+                                            val modes = listOf(
+                                                HyperFolderLayoutMode.REGULAR_1X1,
+                                                HyperFolderLayoutMode.CAPSULE_2X1,
+                                                HyperFolderLayoutMode.TALL_1X2,
+                                                HyperFolderLayoutMode.BIG_FOLDER_2X2
+                                            )
+                                            val nextIdx = (modes.indexOf(folder.layoutMode) + 1) % modes.size
+                                            viewModel.updateFolderLayoutMode(folder.id, modes[nextIdx])
+                                        },
+                                        onResizeFolderSpan = viewModel::resizeFolderSpan,
+                                        onCycleFolderBackgroundColor = viewModel::cycleFolderBackgroundColor,
+                                        onRenameFolder = viewModel::renameFolder,
+                                        onDeleteFolder = viewModel::deleteFolder,
+                                        onMoveFolderOnWorkspace = viewModel::moveFolderOnWorkspace,
+                                        onMoveWidgetOnWorkspace = viewModel::moveWidgetOnWorkspace,
+                                        onResizeWidgetSpan = viewModel::resizeWidgetSpan,
+                                        onCycleWidgetSize = viewModel::cycleWidgetSize,
+                                        onMoveAppOnWorkspace = viewModel::moveAppOnWorkspace,
+                                        onExtractAppFromFolder = { folderId, app, page, order, isDock, cellX, cellY ->
+                                            viewModel.extractAppFromFolderToWorkspace(
+                                                folderId = folderId,
+                                                app = app,
+                                                targetPage = page,
+                                                targetSortOrder = order,
+                                                isDockItem = isDock,
+                                                preferredCellX = cellX,
+                                                preferredCellY = cellY
+                                            )
+                                        },
+                                        onSwapWorkspaceApps = viewModel::swapWorkspaceApps,
+                                        onMergeAppsIntoNewFolder = { draggedApp, targetApp, pageIndex, sourceFolderId ->
+                                            viewModel.mergeAppsIntoNewFolder(
+                                                draggedApp = draggedApp,
+                                                targetApp = targetApp,
+                                                pageIndex = pageIndex,
+                                                sourceFolderId = sourceFolderId
+                                            )
+                                        },
+                                        onMoveAppIntoFolder = { folderId, app, sourceFolderId ->
+                                            viewModel.moveAppIntoFolder(
+                                                folderId = folderId,
+                                                app = app,
+                                                sourceFolderId = sourceFolderId
+                                            )
+                                        },
+                                        onBatchMoveAppsToPage = viewModel::batchMoveAppsToPage,
+                                        onAlignWorkspacePage = viewModel::alignWorkspacePage,
+                                        onSetDefaultHomePage = viewModel::setDefaultHomePageIndex,
+                                        onUpdatePageTransitionEffect = viewModel::updatePageTransitionEffect,
+                                        onOpenWidgetsAndFoldersPicker = { showWidgetsAndFoldersPicker = true },
+                                        onActivePageChanged = { activeWorkspacePage = it },
+                                        onRefreshTelemetry = viewModel::refreshTelemetry,
+                                        onRemoveWidget = viewModel::removeWidget,
+                                        onOpenAppDrawer = { viewModel.selectTab(LauncherTab.APP_DRAWER) },
+                                        onOpenMtzStudio = { viewModel.selectTab(LauncherTab.MTZ_STUDIO) },
+                                        onOpenApiPipeline = { viewModel.selectTab(LauncherTab.API_PIPELINE) },
+                                        onOpenSettings = { viewModel.selectTab(LauncherTab.SETTINGS) },
+                                        onUpdateGridColumns = viewModel::updateGridColumns,
+                                        onUpdateGridRows = viewModel::updateGridRows,
+                                        onUpdateIconSizeDp = viewModel::updateIconSizeDp,
+                                        onToggleShowLabels = viewModel::toggleShowAppLabels,
+                                        onUpdateOverlayShadeAlpha = viewModel::updateOverlayShadeAlpha,
+                                        onUpdateBackgroundBlurMode = viewModel::updateBackgroundBlurMode,
+                                        onUpdateFolderAnimationMode = viewModel::updateFolderAnimationMode,
+                                        onUpdateCustomDockXml = viewModel::updateCustomDockXml,
+                                        onLaunchClockApp = viewModel::launchClockApp,
+                                        onLaunchCalendarApp = viewModel::launchCalendarApp,
+                                        onLaunchWeatherApp = viewModel::launchWeatherApp,
+                                        onRequestWidgetPermissions = requestWidgetPermissions,
+                                        onSetDefaultHomeLauncher = triggerDefaultHomeSelection,
+                                        onPickCustomWallpaper = {
+                                            wallpaperPickerLauncher.launch(
+                                                PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
+                                            )
+                                        },
+                                        onResetToThemeWallpaper = {
+                                            viewModel.setCustomWallpaper(null)
+                                        },
+                                        activeNotificationPackages = uiState.activeNotificationPackages,
+                                        activeNotificationCounts = uiState.activeNotificationCounts,
+                                        onToggleMtzWidgetStyling = viewModel::toggleMtzWidgetStyling,
+                                        onToggleWorkspaceNotificationDots = viewModel::toggleWorkspaceNotificationDots,
+                                        onOpenNotificationAccessSettings = {
+                                            runCatching {
+                                                context.startActivity(
+                                                    Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS).apply {
+                                                        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                                                    }
+                                                )
+                                            }
+                                        },
+                                        externalDraggedApp = externalDraggedApp,
+                                        externalDragSourceFolderId = externalDragSourceFolderId,
+                                        externalDragOffsetInRoot = externalDragOffsetInRoot,
+                                        onRegisterExternalDropHandler = { handler ->
+                                            workspaceExternalDropHandler = handler
+                                        }
+                                    )
+                                }
 
+                                // AppDrawerScreen sits OUTSIDE safeDrawing padding so its shade covers the status bar & navigation bar edge-to-edge!
                                 if (uiState.currentTab == LauncherTab.APP_DRAWER) {
                                     AppDrawerScreen(
                                         allApps = uiState.allApps,
@@ -573,67 +724,111 @@ fun HyperMtzLauncherRoot(
                                             externalDraggedApp = null
                                             externalDragSourceFolderId = null
                                             externalDragOffsetInRoot = Offset.Zero
-                                        }
+                                        },
+                                        overlayShadeAlpha = uiState.engineConfig.overlayShadeAlpha
                                     )
                                 }
                             }
                         }
 
                         LauncherTab.MTZ_STUDIO -> {
-                            MtzStudioScreen(
-                                themes = uiState.installedThemes,
-                                activeThemeId = uiState.engineConfig.activeThemeId,
-                                activeThemeMetadata = uiState.activeThemeMetadata,
-                                activeThemeCatalog = uiState.activeThemeIconCatalog,
-                                onActivateTheme = viewModel::activateMtzTheme,
-                                onRequestImportMtz = {
-                                    importMtzLauncher.launch(arrayOf("*/*"))
-                                },
-                                onRequestExportMtz = { theme ->
-                                    pendingExportTheme = theme
-                                    exportMtzLauncher.launch(theme.archiveFileName)
-                                },
-                                onDeleteCustomTheme = viewModel::deleteCustomMtzTheme,
-                                onCloseStudio = { viewModel.selectTab(LauncherTab.WORKSPACE) }
-                            )
+                            Box(
+                                modifier = Modifier
+                                    .fillMaxSize()
+                                    .windowInsetsPadding(WindowInsets.safeDrawing)
+                            ) {
+                                MtzStudioScreen(
+                                    themes = uiState.installedThemes,
+                                    activeThemeId = uiState.engineConfig.activeThemeId,
+                                    widgetThemeId = uiState.engineConfig.widgetThemeId,
+                                    activeThemeMetadata = uiState.activeThemeMetadata,
+                                    activeWidgetThemeMetadata = uiState.activeWidgetThemeMetadata,
+                                    activeThemeCatalog = uiState.activeThemeIconCatalog,
+                                    onActivateTheme = viewModel::activateMtzTheme,
+                                    onSelectWidgetTheme = viewModel::setWidgetTheme,
+                                    onRequestImportMtz = {
+                                        importMtzLauncher.launch(arrayOf("*/*"))
+                                    },
+                                    onRequestExportMtz = { theme ->
+                                        pendingExportTheme = theme
+                                        exportMtzLauncher.launch(theme.archiveFileName)
+                                    },
+                                    onDeleteCustomTheme = viewModel::deleteCustomMtzTheme,
+                                    onCloseStudio = { viewModel.selectTab(LauncherTab.WORKSPACE) }
+                                )
+                            }
                         }
 
                         LauncherTab.API_PIPELINE -> {
-                            ApiPipelineScreen(
-                                allApps = uiState.allApps,
-                                inspectedApp = uiState.inspectedApp,
-                                breakdown = uiState.pipelineBreakdown,
-                                engineConfig = uiState.engineConfig,
-                                iconCatalog = uiState.activeThemeIconCatalog,
-                                onSelectAppToInspect = { app ->
-                                    viewModel.inspectAppInPipeline(app, switchToTab = false)
-                                },
-                                onUpdateScaleOverride = viewModel::updateScaleOverride,
-                                onToggleDynamicMasking = viewModel::toggleDynamicMasking,
-                                onToggleThirdPartyColorFilter = viewModel::toggleThirdPartyColorFilter,
-                                onToggleFancyMaml = viewModel::toggleFancyMamlIcons,
-                                onToggleIconBorder = viewModel::toggleIconBorderOverlay,
-                                onToggleIconPattern = viewModel::toggleIconPatternOverlay,
-                                onToggleShortcutBadge = viewModel::toggleShortcutBadge,
-                                onToggleColorMatrix = viewModel::toggleColorMatrixFilter,
-                                onToggleLighting = viewModel::toggleLightingFilter,
-                                onAssignOverrideAsset = viewModel::setAppIconOverride,
-                                onClosePipeline = { viewModel.selectTab(LauncherTab.WORKSPACE) }
-                            )
+                            Box(
+                                modifier = Modifier
+                                    .fillMaxSize()
+                                    .windowInsetsPadding(WindowInsets.safeDrawing)
+                            ) {
+                                ApiPipelineScreen(
+                                    allApps = uiState.allApps,
+                                    inspectedApp = uiState.inspectedApp,
+                                    breakdown = uiState.pipelineBreakdown,
+                                    engineConfig = uiState.engineConfig,
+                                    iconCatalog = uiState.activeThemeIconCatalog,
+                                    onSelectAppToInspect = { app ->
+                                        viewModel.inspectAppInPipeline(app, switchToTab = false)
+                                    },
+                                    onUpdateScaleOverride = viewModel::updateScaleOverride,
+                                    onToggleDynamicMasking = viewModel::toggleDynamicMasking,
+                                    onToggleThirdPartyColorFilter = viewModel::toggleThirdPartyColorFilter,
+                                    onToggleFancyMaml = viewModel::toggleFancyMamlIcons,
+                                    onToggleIconBorder = viewModel::toggleIconBorderOverlay,
+                                    onToggleIconPattern = viewModel::toggleIconPatternOverlay,
+                                    onToggleShortcutBadge = viewModel::toggleShortcutBadge,
+                                    onToggleColorMatrix = viewModel::toggleColorMatrixFilter,
+                                    onToggleLighting = viewModel::toggleLightingFilter,
+                                    onAssignOverrideAsset = viewModel::setAppIconOverride,
+                                    inspectedAppActivities = uiState.inspectedAppActivities,
+                                    onRemapAppIconToPackage = viewModel::remapAppIconToPackage,
+                                    onSelectCustomLaunchActivity = viewModel::setAppCustomLaunchActivity,
+                                    onClosePipeline = { viewModel.selectTab(LauncherTab.WORKSPACE) }
+                                )
+                            }
                         }
 
                         LauncherTab.SETTINGS -> {
-                            LauncherSettingsScreen(
-                                engineConfig = uiState.engineConfig,
-                                onSetDefaultHomeLauncher = triggerDefaultHomeSelection,
-                                onUpdateGridColumns = viewModel::updateGridColumns,
-                                onUpdateGridRows = viewModel::updateGridRows,
-                                onUpdateIconSizeDp = viewModel::updateIconSizeDp,
-                                onToggleShowLabels = viewModel::toggleShowAppLabels,
-                                onToggleShowApiBadges = viewModel::toggleShowApiSourceBadges,
-                                onToggleMultiBgHash = viewModel::toggleMultiBgHash,
-                                onCloseSettings = { viewModel.selectTab(LauncherTab.WORKSPACE) }
-                            )
+                            Box(
+                                modifier = Modifier
+                                    .fillMaxSize()
+                                    .windowInsetsPadding(WindowInsets.safeDrawing)
+                            ) {
+                                LauncherSettingsScreen(
+                                    engineConfig = uiState.engineConfig,
+                                    effectiveDockConfig = uiState.effectiveDockConfig,
+                                    deviceTelemetry = uiState.deviceTelemetry,
+                                    onSetDefaultHomeLauncher = triggerDefaultHomeSelection,
+                                    onUpdateGridColumns = viewModel::updateGridColumns,
+                                    onUpdateGridRows = viewModel::updateGridRows,
+                                    onUpdateIconSizeDp = viewModel::updateIconSizeDp,
+                                    onToggleShowLabels = viewModel::toggleShowAppLabels,
+                                    onToggleShowApiBadges = viewModel::toggleShowApiSourceBadges,
+                                    onToggleMultiBgHash = viewModel::toggleMultiBgHash,
+                                    onUpdateOverlayShadeAlpha = viewModel::updateOverlayShadeAlpha,
+                                    onUpdateBackgroundBlurMode = viewModel::updateBackgroundBlurMode,
+                                    onUpdateFolderAnimationMode = viewModel::updateFolderAnimationMode,
+                                    onUpdateCustomDockXml = viewModel::updateCustomDockXml,
+                                    onRequestWidgetPermissions = requestWidgetPermissions,
+                                    isNotificationAccessGranted = com.example.service.LauncherNotificationListenerService.isNotificationAccessGranted(context),
+                                    onToggleMtzWidgetStyling = viewModel::toggleMtzWidgetStyling,
+                                    onToggleWorkspaceNotificationDots = viewModel::toggleWorkspaceNotificationDots,
+                                    onOpenNotificationAccessSettings = {
+                                        runCatching {
+                                            context.startActivity(
+                                                Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS).apply {
+                                                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                                                }
+                                            )
+                                        }
+                                    },
+                                    onCloseSettings = { viewModel.selectTab(LauncherTab.WORKSPACE) }
+                                )
+                            }
                         }
                     }
                 }
@@ -647,6 +842,7 @@ fun HyperMtzLauncherRoot(
                         tonalElevation = 10.dp,
                         modifier = Modifier
                             .align(Alignment.TopCenter)
+                            .windowInsetsPadding(WindowInsets.safeDrawing)
                             .padding(horizontal = 20.dp, vertical = 12.dp)
                             .border(1.dp, EmeraldBright.copy(alpha = 0.7f), RoundedCornerShape(16.dp))
                             .zIndex(90f)
@@ -681,9 +877,17 @@ fun HyperMtzLauncherRoot(
     val sheetApp = selectedAppForSheet
     if (sheetApp != null) {
         val freshApp = uiState.allApps.firstOrNull { it.packageName == sheetApp.packageName } ?: sheetApp
+        var sheetActivities by remember(freshApp.packageName, freshApp.defaultActivityName) {
+            mutableStateOf<List<com.example.domain.model.AppActivityOption>>(emptyList())
+        }
+        LaunchedEffect(freshApp.packageName, freshApp.defaultActivityName) {
+            sheetActivities = viewModel.queryAppActivities(freshApp)
+        }
         AppActionBottomSheet(
             app = freshApp,
             iconCatalog = uiState.activeThemeIconCatalog,
+            allApps = uiState.allApps,
+            appActivities = sheetActivities,
             onDismiss = { selectedAppForSheet = null },
             onLaunch = { viewModel.launchInstalledApp(freshApp) },
             onInspectPipeline = {
@@ -697,6 +901,12 @@ fun HyperMtzLauncherRoot(
             },
             onSelectOverrideAsset = { assetKey ->
                 viewModel.setAppIconOverride(freshApp.packageName, assetKey)
+            },
+            onRemapIconToApp = { targetPkg ->
+                viewModel.remapAppIconToPackage(freshApp.packageName, targetPkg)
+            },
+            onSelectCustomActivity = { activityClassName ->
+                viewModel.setAppCustomLaunchActivity(freshApp.packageName, activityClassName)
             }
         )
     }
@@ -747,7 +957,10 @@ fun HyperMtzLauncherRoot(
                 externalDraggedApp = null
                 externalDragSourceFolderId = null
                 externalDragOffsetInRoot = Offset.Zero
-            }
+            },
+            overlayShadeAlpha = uiState.engineConfig.overlayShadeAlpha,
+            folderAnimationMode = uiState.engineConfig.folderAnimationMode,
+            sourceFolderBounds = expandedFolderSourceBounds
         )
     }
 

@@ -80,7 +80,8 @@ data class WorkspaceWidgetEntity(
 data class IconOverrideEntity(
     @PrimaryKey val packageName: String,
     val themeId: String,
-    val assetKey: String
+    val assetKey: String,
+    val customActivityName: String? = null
 )
 
 @Entity(tableName = "engine_settings")
@@ -101,7 +102,14 @@ data class EngineSettingsEntity(
     val showApiSourceBadges: Boolean = false,
     val pageTransitionEffectCode: String = "CLASSIC",
     val defaultHomePageIndex: Int = 0,
-    val bottomAlignedPagesCsv: String = ""
+    val bottomAlignedPagesCsv: String = "",
+    val overlayShadeAlpha: Float = 0.60f,
+    val backgroundBlurCode: String = "MEDIUM",
+    val folderAnimationCode: String = "MIUI_ZOOM_EXPAND",
+    val customDockXml: String = "",
+    val enableMtzWidgetStyling: Boolean = true,
+    val widgetThemeId: String = "",
+    val enableWorkspaceNotificationDots: Boolean = true
 )
 
 @Dao
@@ -185,7 +193,7 @@ interface LauncherDao {
         IconOverrideEntity::class,
         EngineSettingsEntity::class
     ],
-    version = 10,
+    version = 14,
     exportSchema = false
 )
 abstract class LauncherDatabase : RoomDatabase() {

@@ -12,12 +12,15 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
@@ -106,7 +109,8 @@ fun AppDrawerScreen(
     onStartDragToWorkspace: (InstalledAppItem, Offset) -> Unit = { _, _ -> },
     onUpdateDragToWorkspace: (Offset) -> Unit = {},
     onDropDragToWorkspace: (InstalledAppItem, Offset) -> Unit = { _, _ -> },
-    onCancelDragToWorkspace: () -> Unit = {}
+    onCancelDragToWorkspace: () -> Unit = {},
+    overlayShadeAlpha: Float = 0.60f
 ) {
     var longPressedDrawerApp by remember { mutableStateOf<InstalledAppItem?>(null) }
     var isDraggingToWorkspace by remember { mutableStateOf(false) }
@@ -168,7 +172,8 @@ fun AppDrawerScreen(
             .fillMaxSize()
             .zIndex(35f)
             .alpha(if (isDraggingToWorkspace) 0f else 1f)
-            .background(Color.Black.copy(alpha = 0.56f))
+            .background(Color.Black.copy(alpha = overlayShadeAlpha.coerceIn(0f, 0.95f)))
+            .windowInsetsPadding(WindowInsets.safeDrawing)
             .clickable(
                 interactionSource = remember { MutableInteractionSource() },
                 indication = null,

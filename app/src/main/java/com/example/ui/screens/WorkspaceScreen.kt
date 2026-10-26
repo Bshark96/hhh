@@ -4,6 +4,7 @@ import android.appwidget.AppWidgetHost
 import android.graphics.Bitmap
 import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.animateDpAsState
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.ExperimentalFoundationApi
@@ -34,8 +35,10 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.pager.HorizontalPager
 import androidx.compose.foundation.pager.rememberPagerState
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Animation
@@ -59,11 +62,13 @@ import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Slider
 import androidx.compose.material3.SliderDefaults
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateListOf
@@ -97,17 +102,24 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.zIndex
 import com.example.domain.model.DeviceTelemetrySnapshot
+import com.example.domain.model.DockXmlConfig
 import com.example.domain.model.InstalledAppItem
 import com.example.domain.model.LauncherEngineConfig
+import com.example.domain.model.MiuiBackgroundBlurMode
+import com.example.domain.model.MiuiFolderAnimationMode
 import com.example.domain.model.MiuiPageTransitionEffect
 import com.example.domain.model.MtzThemeMetadata
 import com.example.domain.model.WorkspaceFolder
 import com.example.domain.model.WorkspaceGridAllocator
 import com.example.domain.model.WorkspaceWidgetItem
+import com.example.service.LauncherNotificationListenerService
 import com.example.ui.components.AppIconTile
+import com.example.ui.components.DockXmlLiveEditorDialog
+import com.example.ui.components.DockXmlPresetSelectorSection
 import com.example.ui.components.HyperFolderCard
 import com.example.ui.components.HyperWorkspaceWidgetCard
 import com.example.ui.components.MiuiAppFloatingActionPill
+import com.example.ui.components.MiuiCustomizableDockContainer
 import com.example.ui.components.MiuiFolderFloatingActionPill
 import com.example.ui.components.MiuiWidgetFloatingActionPill
 import com.example.ui.components.miuiIconTapLongPressAndDrag
@@ -214,6 +226,8 @@ private fun resolveSinglePage2DLayout(
 @Composable
 fun WorkspaceScreen(
     activeTheme: MtzThemeMetadata?,
+    activeWidgetTheme: MtzThemeMetadata? = activeTheme,
+    effectiveDockConfig: DockXmlConfig = DockXmlConfig(),
     wallpaperBitmap: Bitmap?,
     engineConfig: LauncherEngineConfig,
     allApps: List<InstalledAppItem>,
@@ -230,6 +244,7 @@ fun WorkspaceScreen(
     onShareApp: (InstalledAppItem) -> Unit = {},
     onOpenAppInfo: (InstalledAppItem) -> Unit = {},
     onExpandFolder: (WorkspaceFolder) -> Unit,
+    onExpandFolderWithBounds: (WorkspaceFolder, Rect) -> Unit = { folder, _ -> onExpandFolder(folder) },
     onCycleFolderMode: (WorkspaceFolder) -> Unit,
     onResizeFolderSpan: (String, Int, Int) -> Unit = { _, _, _ -> },
     onCycleFolderBackgroundColor: (String) -> Unit = {},
@@ -260,9 +275,22 @@ fun WorkspaceScreen(
     onUpdateGridRows: (Int) -> Unit = {},
     onUpdateIconSizeDp: (Int) -> Unit = {},
     onToggleShowLabels: (Boolean) -> Unit = {},
+    onUpdateOverlayShadeAlpha: (Float) -> Unit = {},
+    onUpdateBackgroundBlurMode: (MiuiBackgroundBlurMode) -> Unit = {},
+    onUpdateFolderAnimationMode: (MiuiFolderAnimationMode) -> Unit = {},
+    onUpdateCustomDockXml: (String) -> Unit = {},
+    onLaunchClockApp: () -> Unit = {},
+    onLaunchCalendarApp: (Long) -> Unit = {},
+    onLaunchWeatherApp: () -> Unit = {},
+    onRequestWidgetPermissions: () -> Unit = {},
     onSetDefaultHomeLauncher: () -> Unit = {},
     onPickCustomWallpaper: () -> Unit = {},
     onResetToThemeWallpaper: () -> Unit = {},
+    activeNotificationPackages: Set<String> = emptySet(),
+    activeNotificationCounts: Map<String, Int> = emptyMap(),
+    onToggleMtzWidgetStyling: (Boolean) -> Unit = {},
+    onToggleWorkspaceNotificationDots: (Boolean) -> Unit = {},
+    onOpenNotificationAccessSettings: () -> Unit = {},
     externalDraggedApp: InstalledAppItem? = null,
     externalDragSourceFolderId: String? = null,
     externalDragOffsetInRoot: Offset = Offset.Zero,
@@ -275,6 +303,7 @@ fun WorkspaceScreen(
     var showDesktopOptionsSheet by remember { mutableStateOf(false) }
     var showTransitionEffectSheet by remember { mutableStateOf(false) }
     var showWallpaperQuickSheet by remember { mutableStateOf(false) }
+    var showDockXmlLiveEditorDialog by remember { mutableStateOf(false) }
 
     // MIUI Long-Tap Workspace Edit Mode State
     var isWorkspaceEditMode by remember { mutableStateOf(false) }
@@ -337,9 +366,17 @@ fun WorkspaceScreen(
         pageCount = { pageCount }
     )
 
+    // Counter incremented on every workspace page swipe so MAML fancy_icons replay their timeline from t=0ms
+    var mamlSwipeReplayTick by remember { mutableIntStateOf(0) }
+
     // Notify MainActivity whenever the active workspace page changes
     LaunchedEffect(pagerState.currentPage) {
         onActivePageChanged(pagerState.currentPage)
+    }
+
+    // Replay MAML fancy_icons animations ONLY once after the workspace page finishes settling
+    LaunchedEffect(pagerState.settledPage) {
+        mamlSwipeReplayTick += 1
     }
 
     // Clamp current page if trailing pages were dynamically removed
@@ -350,9 +387,15 @@ fun WorkspaceScreen(
     }
 
     // BackHandler for dismissing Floating Pill, Folder Edit Mode, Widget Edit Mode, or Workspace Edit Mode
+    // Also resets isAnyIconHoldOrDragActive so subsequent long-taps, taps, and swipes are never locked!
     BackHandler(
-        enabled = longPressedApp != null || editingFolderId != null || editingWidgetId != null || isWorkspaceEditMode
+        enabled = longPressedApp != null || editingFolderId != null || editingWidgetId != null || isWorkspaceEditMode || isAnyIconHoldOrDragActive
     ) {
+        isAnyIconHoldOrDragActive = false
+        internalDraggedApp = null
+        internalDragSourceFolderId = null
+        draggedFolder = null
+        draggedWidget = null
         when {
             longPressedApp != null -> longPressedApp = null
             editingFolderId != null -> editingFolderId = null
@@ -515,12 +558,8 @@ fun WorkspaceScreen(
                 }
 
                 if (targetApp != null) {
-                    if (droppedApp.isPinnedToDock && sourceFolderId == null) {
-                        onSwapWorkspaceApps(droppedApp.packageName, targetApp.packageName)
-                    } else {
-                        // Dropping an icon onto another workspace icon creates a new folder!
-                        onMergeAppsIntoNewFolder(droppedApp, targetApp, currentPage, sourceFolderId)
-                    }
+                    // Dropping any icon (including from the dock!) onto a workspace icon merges them into a folder!
+                    onMergeAppsIntoNewFolder(droppedApp, targetApp, currentPage, sourceFolderId)
                 } else {
                     // 4. Dropped onto a 2D cell (including shared-row cells beside a folder/widget) on currentPage
                     val appsOnPage = workspaceApps.count { it.workspacePage == currentPage }
@@ -643,11 +682,11 @@ fun WorkspaceScreen(
                 interactionSource = remember { MutableInteractionSource() },
                 indication = null,
                 onClick = {
-                    if (!isAnyIconHoldOrDragActive &&
-                        activeDraggedApp == null &&
+                    if (activeDraggedApp == null &&
                         draggedFolder == null &&
                         draggedWidget == null
                     ) {
+                        isAnyIconHoldOrDragActive = false
                         when {
                             longPressedApp != null -> longPressedApp = null
                             editingFolderId != null -> editingFolderId = null
@@ -803,11 +842,14 @@ fun WorkspaceScreen(
                         )
                     }
 
-                    // 0. Highlight Target 2D Grid Footprint during active Drag-and-Drop on the current page
-                    val isDraggingAnythingOnThisPage =
+                    // 0. Highlight Target 2D Grid Footprint & Folder Hover during active Drag-and-Drop on the current page
+                    val isDraggingOnThisPage =
                         pagerState.currentPage == pageIndex &&
                             (activeDraggedApp != null || draggedFolder != null || draggedWidget != null)
-                    if (isDraggingAnythingOnThisPage) {
+                    val isDraggingOverDock =
+                        activeDraggedApp != null && !isWorkspaceEditMode && dockBounds.contains(activeDragFingerOffsetInRoot)
+
+                    val (hoverCellX, hoverCellY) = if (isDraggingOnThisPage && !isDraggingOverDock) {
                         val dragSpanX = when {
                             draggedWidget != null -> draggedWidget!!.spanX.coerceIn(1, gridCols)
                             draggedFolder != null -> draggedFolder!!.spanX.coerceIn(1, gridCols)
@@ -818,17 +860,58 @@ fun WorkspaceScreen(
                             draggedFolder != null -> draggedFolder!!.spanY.coerceIn(1, gridRows)
                             else -> 1
                         }
-                        val (hoverCellX, hoverCellY) = computeTargetGridCell(
-                            pageIndex,
-                            activeDragFingerOffsetInRoot,
-                            dragSpanX,
-                            dragSpanY
-                        )
+                        computeTargetGridCell(pageIndex, activeDragFingerOffsetInRoot, dragSpanX, dragSpanY)
+                    } else {
+                        -1 to -1
+                    }
+
+                    val hoveredFolderOnPage: WorkspaceFolder? = if (
+                        activeDraggedApp != null &&
+                        pagerState.currentPage == pageIndex &&
+                        !isDraggingOverDock
+                    ) {
+                        resolvedPage.folders.firstOrNull { f ->
+                            f.id != activeDragSourceFolderId &&
+                                (folderBoundsMap[f.id]?.contains(activeDragFingerOffsetInRoot) == true ||
+                                    (hoverCellX in f.cellX until (f.cellX + f.spanX) &&
+                                        hoverCellY in f.cellY until (f.cellY + f.spanY)))
+                        }
+                    } else {
+                        null
+                    }
+
+                    val hoveredMergeTargetApp: InstalledAppItem? = if (
+                        activeDraggedApp != null &&
+                        pagerState.currentPage == pageIndex &&
+                        !isDraggingOverDock &&
+                        hoveredFolderOnPage == null
+                    ) {
+                        resolvedPage.apps.firstOrNull { candidate ->
+                            candidate.packageName != activeDraggedApp.packageName &&
+                                candidate.cellX == hoverCellX &&
+                                candidate.cellY == hoverCellY &&
+                                appBoundsMap[candidate.packageName]?.contains(activeDragFingerOffsetInRoot) == true
+                        }
+                    } else {
+                        null
+                    }
+
+                    if (isDraggingOnThisPage && !isDraggingOverDock && hoveredFolderOnPage == null && hoveredMergeTargetApp == null) {
+                        val dragSpanX = when {
+                            draggedWidget != null -> draggedWidget!!.spanX.coerceIn(1, gridCols)
+                            draggedFolder != null -> draggedFolder!!.spanX.coerceIn(1, gridCols)
+                            else -> 1
+                        }
+                        val dragSpanY = when {
+                            draggedWidget != null -> draggedWidget!!.spanY.coerceIn(1, gridRows)
+                            draggedFolder != null -> draggedFolder!!.spanY.coerceIn(1, gridRows)
+                            else -> 1
+                        }
                         Box(
                             modifier = Modifier
                                 .offset(
-                                    x = cellWidthDp * hoverCellX,
-                                    y = cellHeightDp * hoverCellY
+                                    x = cellWidthDp * hoverCellX.coerceAtLeast(0),
+                                    y = cellHeightDp * hoverCellY.coerceAtLeast(0)
                                 )
                                 .size(
                                     width = cellWidthDp * dragSpanX,
@@ -869,7 +952,7 @@ fun WorkspaceScreen(
                                 widget = widget,
                                 timeString = timeString,
                                 dateString = dateString,
-                                activeTheme = activeTheme,
+                                activeTheme = activeWidgetTheme ?: activeTheme,
                                 engineConfig = engineConfig,
                                 telemetry = deviceTelemetry,
                                 allApps = allApps,
@@ -883,6 +966,10 @@ fun WorkspaceScreen(
                                     onRemoveWidget(id)
                                 },
                                 onLaunchApp = onAppClick,
+                                onLaunchClockApp = onLaunchClockApp,
+                                onLaunchCalendarApp = onLaunchCalendarApp,
+                                onLaunchWeatherApp = onLaunchWeatherApp,
+                                onRequestWidgetPermissions = onRequestWidgetPermissions,
                                 isEditingWidget = isEditingThisWidget,
                                 isWorkspaceEditMode = isWorkspaceEditMode,
                                 onEnterEditMode = { targetWidget ->
@@ -915,6 +1002,9 @@ fun WorkspaceScreen(
                                     isAnyIconHoldOrDragActive = false
                                     draggedWidget = null
                                 },
+                                onReleaseFingerHold = {
+                                    isAnyIconHoldOrDragActive = false
+                                },
                                 onResizeWidgetSpan = { spanX, spanY ->
                                     onResizeWidgetSpan(widget.id, spanX, spanY)
                                 }
@@ -926,6 +1016,7 @@ fun WorkspaceScreen(
                     // Remaining cells in the same row(s) stay open for 1x1 app icons or other items!
                     resolvedPage.folders.forEach { folder ->
                         val isEditingThisFolder = editingFolderId == folder.id
+                        val isFolderDragHovered = hoveredFolderOnPage?.id == folder.id
                         val clampedSpanX = folder.spanX.coerceIn(1, gridCols)
                         val clampedSpanY = folder.spanY.coerceIn(1, gridRows)
                         val clampedCellX = folder.cellX.coerceIn(0, (gridCols - clampedSpanX).coerceAtLeast(0))
@@ -942,7 +1033,7 @@ fun WorkspaceScreen(
                                     width = cellWidthDp * clampedSpanX,
                                     height = cellHeightDp * clampedSpanY
                                 )
-                                .zIndex(if (isEditingThisFolder) 20f else 3f)
+                                .zIndex(if (isEditingThisFolder || isFolderDragHovered) 20f else 3f)
                                 .alpha(if (draggedFolder?.id == folder.id) 0.35f else 1f)
                                 .onGloballyPositioned { coords ->
                                     folderBoundsMap[folder.id] = coords.boundsInRoot()
@@ -968,8 +1059,10 @@ fun WorkspaceScreen(
                                 onExpandFolder = {
                                     if (editingFolderId != null) {
                                         editingFolderId = null
+                                        isAnyIconHoldOrDragActive = false
                                     } else {
-                                        onExpandFolder(folder)
+                                        val bounds = folderBoundsMap[folder.id] ?: Rect.Zero
+                                        onExpandFolderWithBounds(folder, bounds)
                                     }
                                 },
                                 onCycleLayoutMode = onCycleFolderMode,
@@ -1042,8 +1135,15 @@ fun WorkspaceScreen(
                                     isAnyIconHoldOrDragActive = false
                                     draggedFolder = null
                                 },
+                                onReleaseFingerHold = {
+                                    isAnyIconHoldOrDragActive = false
+                                },
+                                isDragHovered = isFolderDragHovered,
+                                animRestartKey = if (pageIndex == pagerState.settledPage) "${pageIndex}_$mamlSwipeReplayTick" else "${pageIndex}_idle",
                                 iconSize = effectiveCellIconSize,
-                                showLabel = engineConfig.showAppLabels
+                                showLabel = engineConfig.showAppLabels,
+                                activeTheme = activeTheme,
+                                enableMtzWidgetStyling = engineConfig.enableMtzWidgetStyling
                             )
                         }
                     }
@@ -1055,6 +1155,7 @@ fun WorkspaceScreen(
                         var itemBoundsInRoot by remember(app.packageName) { mutableStateOf(Rect.Zero) }
                         var isPickedUp by remember(app.packageName) { mutableStateOf(false) }
                         val isSelectedInEdit = app.packageName in selectedEditPackages
+                        val isMergeTargetHovered = hoveredMergeTargetApp?.packageName == app.packageName
 
                         Box(
                             contentAlignment = Alignment.TopCenter,
@@ -1067,7 +1168,7 @@ fun WorkspaceScreen(
                                     width = cellWidthDp,
                                     height = cellHeightDp
                                 )
-                                .zIndex(4f)
+                                .zIndex(if (isMergeTargetHovered) 14f else 4f)
                                 .alpha(if (activeDraggedApp?.packageName == app.packageName) 0.3f else 1f)
                                 .onGloballyPositioned { coords ->
                                     val rect = coords.boundsInRoot()
@@ -1082,8 +1183,14 @@ fun WorkspaceScreen(
                                     onTap = {
                                         when {
                                             longPressedApp != null -> longPressedApp = null
-                                            editingFolderId != null -> editingFolderId = null
-                                            editingWidgetId != null -> editingWidgetId = null
+                                            editingFolderId != null -> {
+                                                editingFolderId = null
+                                                isAnyIconHoldOrDragActive = false
+                                            }
+                                            editingWidgetId != null -> {
+                                                editingWidgetId = null
+                                                isAnyIconHoldOrDragActive = false
+                                            }
                                             isWorkspaceEditMode -> {
                                                 if (app.packageName in selectedEditPackages) {
                                                     selectedEditPackages.remove(app.packageName)
@@ -1141,15 +1248,37 @@ fun WorkspaceScreen(
                                     }
                                 )
                         ) {
+                            if (isMergeTargetHovered) {
+                                Box(
+                                    modifier = Modifier
+                                        .padding(top = 4.dp)
+                                        .size(effectiveCellIconSize + 10.dp)
+                                        .clip(RoundedCornerShape(18.dp))
+                                        .background(Color(0xFF38BDF8).copy(alpha = 0.28f))
+                                        .border(2.dp, Color(0xFF38BDF8), RoundedCornerShape(18.dp))
+                                        .testTag("folder_merge_target_highlight_${app.packageName}")
+                                )
+                            }
+                            val workspaceBadgeCount = if (engineConfig.enableWorkspaceNotificationDots) {
+                                LauncherNotificationListenerService.resolveNotificationBadgeCount(
+                                    packageName = app.packageName,
+                                    activeCounts = activeNotificationCounts
+                                )
+                            } else {
+                                0
+                            }
                             AppIconTile(
                                 app = app,
                                 iconSize = effectiveCellIconSize,
                                 showLabel = engineConfig.showAppLabels,
                                 showApiBadge = engineConfig.showApiSourceBadges,
+                                hasNotificationDot = engineConfig.enableWorkspaceNotificationDots && (workspaceBadgeCount > 0 || app.packageName in activeNotificationPackages),
+                                notificationCount = workspaceBadgeCount,
                                 showEditSelectionBadge = isWorkspaceEditMode,
                                 isSelectedForEdit = isSelectedInEdit,
                                 enableClickHandling = false,
                                 isPickedUp = isPickedUp || longPressedApp?.packageName == app.packageName,
+                                animRestartKey = if (pageIndex == pagerState.settledPage) "${pageIndex}_$mamlSwipeReplayTick" else "${pageIndex}_idle",
                                 onClick = {},
                                 onLongClick = {}
                             )
@@ -1260,130 +1389,229 @@ fun WorkspaceScreen(
                     )
                 }
             } else {
-                // Stock MIUI Bottom Pin Bar (Dock): up to `gridCols` (4, 5, or 6) icons, centered when fewer
+                // Stock MIUI Bottom Pin Bar (Dock) or Custom <DockConfig> XML Dock:
+                // - Supports dragging icons both INTO the dock and OUT OF the dock onto any workspace cell/folder/icon!
+                // - All visibleDockApps stay mounted with key(app.packageName) during drag so pointerInput is never cancelled.
+                // - When hovering over the dock, shifts icons apart with animateDpAsState and highlights the target slot in light blue (#38BDF8).
                 val visibleDockApps = dockApps.take(gridCols)
-                BoxWithConstraints(
-                    contentAlignment = Alignment.Center,
+                val isDraggingDockApp =
+                    activeDraggedApp != null && visibleDockApps.any { it.packageName == activeDraggedApp.packageName }
+                val isHoveringDockForDrop =
+                    activeDraggedApp != null && !isWorkspaceEditMode && dockBounds.contains(activeDragFingerOffsetInRoot)
+                val otherDockAppsWhenDragging = if (activeDraggedApp != null) {
+                    visibleDockApps.filter { it.packageName != activeDraggedApp.packageName }
+                } else {
+                    visibleDockApps
+                }
+                val canInsertIntoDockWithShift =
+                    isHoveringDockForDrop && otherDockAppsWhenDragging.size < gridCols
+                val hoverDockInsertIdx = if (canInsertIntoDockWithShift) {
+                    otherDockAppsWhenDragging.count { dockApp ->
+                        val b = appBoundsMap[dockApp.packageName]
+                        b != null && b != Rect.Zero && activeDragFingerOffsetInRoot.x > b.center.x
+                    }.coerceIn(0, otherDockAppsWhenDragging.size)
+                } else {
+                    -1
+                }
+                val hoverDockSwapPkg = if (isHoveringDockForDrop && !canInsertIntoDockWithShift) {
+                    visibleDockApps.firstOrNull { dockApp ->
+                        dockApp.packageName != activeDraggedApp?.packageName &&
+                            appBoundsMap[dockApp.packageName]?.contains(activeDragFingerOffsetInRoot) == true
+                    }?.packageName ?: visibleDockApps.minByOrNull { dockApp ->
+                        val b = appBoundsMap[dockApp.packageName]
+                        if (b != null && b != Rect.Zero) abs(activeDragFingerOffsetInRoot.x - b.center.x) else Float.MAX_VALUE
+                    }?.packageName
+                } else {
+                    null
+                }
+
+                MiuiCustomizableDockContainer(
+                    dockConfig = effectiveDockConfig,
+                    extractedThemeDirPath = activeTheme?.extractedDirPath,
                     modifier = Modifier
-                        .fillMaxWidth()
-                        .defaultMinSize(minHeight = 64.dp)
-                        .padding(horizontal = 4.dp, vertical = 6.dp)
                         .onGloballyPositioned { coords ->
                             dockBounds = coords.boundsInRoot()
                         }
                         .testTag("workspace_dock")
                 ) {
-                    val slotWidthDp = maxWidth / gridCols
-                    val maxSafeDockIconDp = (slotWidthDp - 8.dp).coerceAtLeast(32.dp)
-                    val effectiveDockIconSize = engineConfig.iconSizeDp.dp.coerceIn(
-                        32.dp,
-                        maxSafeDockIconDp.coerceAtMost(72.dp)
-                    )
-
-                    Row(
-                        horizontalArrangement = Arrangement.Center,
-                        verticalAlignment = Alignment.CenterVertically
+                    BoxWithConstraints(
+                        contentAlignment = Alignment.CenterStart,
+                        modifier = Modifier.fillMaxWidth()
                     ) {
-                        visibleDockApps.forEach { app ->
-                            var dockItemBounds by remember(app.packageName) { mutableStateOf(Rect.Zero) }
-                            var isPickedUp by remember(app.packageName) { mutableStateOf(false) }
-                            val showUnreadBadge = app.packageName.contains("mms", ignoreCase = true) ||
-                                app.label.equals("Messaging", ignoreCase = true)
+                        val slotWidthDp = maxWidth / gridCols
+                        val maxSafeDockIconDp = (slotWidthDp - 8.dp).coerceAtLeast(32.dp)
+                        val dockScaleMultiplier = if (effectiveDockConfig.isCustomDockEnabled) {
+                            effectiveDockConfig.iconScale.coerceIn(0.65f, 1.25f)
+                        } else {
+                            1.0f
+                        }
+                        val effectiveDockIconSize = (engineConfig.iconSizeDp.dp * dockScaleMultiplier).coerceIn(
+                            32.dp,
+                            maxSafeDockIconDp.coerceAtMost(72.dp)
+                        )
 
+                        val activeVisualSlotCount = when {
+                            canInsertIntoDockWithShift -> (otherDockAppsWhenDragging.size + 1).coerceAtLeast(1)
+                            isDraggingDockApp && !isHoveringDockForDrop -> otherDockAppsWhenDragging.size.coerceAtLeast(1)
+                            else -> visibleDockApps.size.coerceAtLeast(1)
+                        }
+                        val rowStartXDp = (maxWidth - slotWidthDp * activeVisualSlotCount) / 2f
+
+                        // 1. Light-blue (#38BDF8) shifted-apart target slot outline when hovering over the dock
+                        if (canInsertIntoDockWithShift && hoverDockInsertIdx >= 0) {
+                            val highlightXDp by animateDpAsState(
+                                targetValue = rowStartXDp + slotWidthDp * hoverDockInsertIdx,
+                                label = "dockHighlightSlotX"
+                            )
                             Box(
                                 contentAlignment = Alignment.Center,
-                                modifier = Modifier.width(slotWidthDp)
+                                modifier = Modifier
+                                    .offset(x = highlightXDp)
+                                    .width(slotWidthDp)
+                                    .padding(vertical = 6.dp)
+                                    .testTag("dock_drop_slot_highlight")
                             ) {
                                 Box(
-                                    contentAlignment = Alignment.TopEnd,
                                     modifier = Modifier
-                                        .alpha(if (activeDraggedApp?.packageName == app.packageName) 0.3f else 1f)
-                                        .onGloballyPositioned { coords ->
-                                            val rect = coords.boundsInRoot()
-                                            dockItemBounds = rect
-                                            appBoundsMap[app.packageName] = rect
-                                        }
-                                        .miuiIconTapLongPressAndDrag(
-                                            key1 = app.packageName,
-                                            key2 = "dock",
-                                            dragThreshold = 12.dp,
-                                            onTap = {
-                                                if (longPressedApp != null) {
-                                                    longPressedApp = null
-                                                } else {
-                                                    onAppClick(app)
-                                                }
-                                            },
-                                            onLongPressReached = {
-                                                isPickedUp = true
-                                                isAnyIconHoldOrDragActive = true
-                                                editingFolderId = null
-                                                editingWidgetId = null
-                                                longPressedAppBounds = dockItemBounds
-                                                longPressedApp = app
-                                            },
-                                            onReleaseWithoutDrag = {
-                                                isPickedUp = false
-                                                isAnyIconHoldOrDragActive = false
-                                            },
-                                            onDragStart = { fingerRootPos ->
-                                                isPickedUp = false
-                                                isAnyIconHoldOrDragActive = true
-                                                longPressedApp = null
-                                                editingFolderId = null
-                                                editingWidgetId = null
-                                                internalDraggedApp = app
-                                                internalDragSourceFolderId = null
-                                                internalDragFingerOffsetInRoot = fingerRootPos
-                                            },
-                                            onDragMove = { fingerRootPos, _ ->
-                                                internalDragFingerOffsetInRoot = fingerRootPos
-                                            },
-                                            onDragDrop = { fingerRootPos ->
-                                                isPickedUp = false
-                                                isAnyIconHoldOrDragActive = false
-                                                val currentDragged = internalDraggedApp ?: app
-                                                internalDraggedApp = null
-                                                internalDragSourceFolderId = null
-                                                handleDropApp(currentDragged, null, fingerRootPos)
-                                            },
-                                            onDragCancel = {
-                                                isPickedUp = false
-                                                isAnyIconHoldOrDragActive = false
-                                                internalDraggedApp = null
-                                                internalDragSourceFolderId = null
-                                            }
+                                        .size(effectiveDockIconSize)
+                                        .clip(RoundedCornerShape(16.dp))
+                                        .background(Color(0xFF38BDF8).copy(alpha = 0.22f))
+                                        .border(
+                                            width = 2.dp,
+                                            color = Color(0xFF38BDF8),
+                                            shape = RoundedCornerShape(16.dp)
                                         )
-                                ) {
-                                    AppIconTile(
-                                        app = app,
-                                        iconSize = effectiveDockIconSize,
-                                        showLabel = false,
-                                        showApiBadge = engineConfig.showApiSourceBadges,
-                                        enableClickHandling = false,
-                                        isPickedUp = isPickedUp || longPressedApp?.packageName == app.packageName,
-                                        onClick = {},
-                                        onLongClick = {}
-                                    )
+                                )
+                            }
+                        }
 
-                                    if (showUnreadBadge) {
+                        // 2. Render all visibleDockApps keyed by packageName so dragging FROM the dock never unmounts the dragged node!
+                        visibleDockApps.forEachIndexed { originalIdx, app ->
+                            key(app.packageName) {
+                                val isBeingDragged = activeDraggedApp?.packageName == app.packageName
+                                val idxInOthers = otherDockAppsWhenDragging.indexOfFirst { it.packageName == app.packageName }
+                                val targetSlotIndex = when {
+                                    isBeingDragged -> originalIdx
+                                    canInsertIntoDockWithShift && idxInOthers >= 0 -> {
+                                        if (idxInOthers >= hoverDockInsertIdx) idxInOthers + 1 else idxInOthers
+                                    }
+                                    isDraggingDockApp && !isHoveringDockForDrop && idxInOthers >= 0 -> idxInOthers
+                                    else -> originalIdx
+                                }
+                                val animatedSlotXDp by animateDpAsState(
+                                    targetValue = rowStartXDp + slotWidthDp * targetSlotIndex,
+                                    label = "dockAppSlotX_${app.packageName}"
+                                )
+
+                                var dockItemBounds by remember(app.packageName) { mutableStateOf(Rect.Zero) }
+                                var isPickedUp by remember(app.packageName) { mutableStateOf(false) }
+                                val isSwapTargetHighlighted = hoverDockSwapPkg == app.packageName
+
+                                Box(
+                                    contentAlignment = Alignment.Center,
+                                    modifier = Modifier
+                                        .offset(x = animatedSlotXDp)
+                                        .width(slotWidthDp)
+                                ) {
+                                    if (isSwapTargetHighlighted) {
                                         Box(
-                                            contentAlignment = Alignment.Center,
                                             modifier = Modifier
-                                                .offset(x = (-2).dp, y = 2.dp)
-                                                .clip(CircleShape)
-                                                .background(Color(0xFFFF3B30))
-                                                .padding(horizontal = 5.dp, vertical = 1.dp)
-                                        ) {
-                                            Text(
-                                                text = "20",
-                                                style = MaterialTheme.typography.labelSmall.copy(
-                                                    fontSize = 10.sp,
-                                                    fontWeight = FontWeight.Bold
-                                                ),
-                                                color = Color.White
+                                                .size(effectiveDockIconSize + 8.dp)
+                                                .clip(RoundedCornerShape(16.dp))
+                                                .background(Color(0xFF38BDF8).copy(alpha = 0.24f))
+                                                .border(2.dp, Color(0xFF38BDF8), RoundedCornerShape(16.dp))
+                                                .testTag("dock_drop_slot_highlight")
+                                        )
+                                    }
+                                    Box(
+                                        contentAlignment = Alignment.TopEnd,
+                                        modifier = Modifier
+                                            .alpha(
+                                                when {
+                                                    isBeingDragged && canInsertIntoDockWithShift -> 0.02f
+                                                    isBeingDragged && !isHoveringDockForDrop -> 0.02f
+                                                    isBeingDragged -> 0.30f
+                                                    else -> 1f
+                                                }
                                             )
+                                            .onGloballyPositioned { coords ->
+                                                val rect = coords.boundsInRoot()
+                                                dockItemBounds = rect
+                                                appBoundsMap[app.packageName] = rect
+                                            }
+                                            .miuiIconTapLongPressAndDrag(
+                                                key1 = app.packageName,
+                                                key2 = "dock",
+                                                dragThreshold = 12.dp,
+                                                onTap = {
+                                                    if (longPressedApp != null) {
+                                                        longPressedApp = null
+                                                    } else {
+                                                        onAppClick(app)
+                                                    }
+                                                },
+                                                onLongPressReached = {
+                                                    isPickedUp = true
+                                                    isAnyIconHoldOrDragActive = true
+                                                    editingFolderId = null
+                                                    editingWidgetId = null
+                                                    longPressedAppBounds = dockItemBounds
+                                                    longPressedApp = app
+                                                },
+                                                onReleaseWithoutDrag = {
+                                                    isPickedUp = false
+                                                    isAnyIconHoldOrDragActive = false
+                                                },
+                                                onDragStart = { fingerRootPos ->
+                                                    isPickedUp = false
+                                                    isAnyIconHoldOrDragActive = true
+                                                    longPressedApp = null
+                                                    editingFolderId = null
+                                                    editingWidgetId = null
+                                                    internalDraggedApp = app
+                                                    internalDragSourceFolderId = null
+                                                    internalDragFingerOffsetInRoot = fingerRootPos
+                                                },
+                                                onDragMove = { fingerRootPos, _ ->
+                                                    internalDragFingerOffsetInRoot = fingerRootPos
+                                                },
+                                                onDragDrop = { fingerRootPos ->
+                                                    isPickedUp = false
+                                                    isAnyIconHoldOrDragActive = false
+                                                    val currentDragged = internalDraggedApp ?: app
+                                                    internalDraggedApp = null
+                                                    internalDragSourceFolderId = null
+                                                    handleDropApp(currentDragged, null, fingerRootPos)
+                                                },
+                                                onDragCancel = {
+                                                    isPickedUp = false
+                                                    isAnyIconHoldOrDragActive = false
+                                                    internalDraggedApp = null
+                                                    internalDragSourceFolderId = null
+                                                }
+                                            )
+                                    ) {
+                                        val dockBadgeCount = if (engineConfig.enableWorkspaceNotificationDots) {
+                                            LauncherNotificationListenerService.resolveNotificationBadgeCount(
+                                                packageName = app.packageName,
+                                                activeCounts = activeNotificationCounts
+                                            )
+                                        } else {
+                                            0
                                         }
+                                        AppIconTile(
+                                            app = app,
+                                            iconSize = effectiveDockIconSize,
+                                            showLabel = false,
+                                            showApiBadge = engineConfig.showApiSourceBadges,
+                                            hasNotificationDot = engineConfig.enableWorkspaceNotificationDots && (dockBadgeCount > 0 || app.packageName in activeNotificationPackages),
+                                            notificationCount = dockBadgeCount,
+                                            enableClickHandling = false,
+                                            isPickedUp = isPickedUp || longPressedApp?.packageName == app.packageName,
+                                            animRestartKey = "dock_$mamlSwipeReplayTick",
+                                            onClick = {},
+                                            onLongClick = {}
+                                        )
                                     }
                                 }
                             }
@@ -1682,11 +1910,19 @@ fun WorkspaceScreen(
     if (showDesktopOptionsSheet) {
         DesktopOptionsBottomSheet(
             engineConfig = engineConfig,
+            effectiveDockConfig = effectiveDockConfig,
             onDismiss = { showDesktopOptionsSheet = false },
             onUpdateGridColumns = onUpdateGridColumns,
             onUpdateGridRows = onUpdateGridRows,
             onUpdateIconSizeDp = onUpdateIconSizeDp,
             onToggleShowLabels = onToggleShowLabels,
+            onUpdateOverlayShadeAlpha = onUpdateOverlayShadeAlpha,
+            onUpdateBackgroundBlurMode = onUpdateBackgroundBlurMode,
+            onUpdateFolderAnimationMode = onUpdateFolderAnimationMode,
+            onUpdateCustomDockXml = onUpdateCustomDockXml,
+            onOpenDockXmlEditor = {
+                showDockXmlLiveEditorDialog = true
+            },
             onOpenWidgetsAndFoldersPicker = {
                 showDesktopOptionsSheet = false
                 onOpenWidgetsAndFoldersPicker()
@@ -1714,6 +1950,23 @@ fun WorkspaceScreen(
             onResetToThemeWallpaper = {
                 showDesktopOptionsSheet = false
                 onResetToThemeWallpaper()
+            },
+            onToggleMtzWidgetStyling = onToggleMtzWidgetStyling,
+            onToggleWorkspaceNotificationDots = onToggleWorkspaceNotificationDots,
+            onOpenNotificationAccessSettings = {
+                showDesktopOptionsSheet = false
+                onOpenNotificationAccessSettings()
+            }
+        )
+    }
+
+    if (showDockXmlLiveEditorDialog) {
+        DockXmlLiveEditorDialog(
+            initialXml = engineConfig.customDockXml,
+            themeDefaultXml = activeTheme?.rawDockConfigXml.orEmpty(),
+            onDismiss = { showDockXmlLiveEditorDialog = false },
+            onApplyXml = { xml ->
+                onUpdateCustomDockXml(xml)
             }
         )
     }
@@ -2168,18 +2421,27 @@ private fun MiuiTransitionEffectModal(
 @Composable
 private fun DesktopOptionsBottomSheet(
     engineConfig: LauncherEngineConfig,
+    effectiveDockConfig: DockXmlConfig,
     onDismiss: () -> Unit,
     onUpdateGridColumns: (Int) -> Unit,
     onUpdateGridRows: (Int) -> Unit,
     onUpdateIconSizeDp: (Int) -> Unit,
     onToggleShowLabels: (Boolean) -> Unit,
+    onUpdateOverlayShadeAlpha: (Float) -> Unit,
+    onUpdateBackgroundBlurMode: (MiuiBackgroundBlurMode) -> Unit,
+    onUpdateFolderAnimationMode: (MiuiFolderAnimationMode) -> Unit,
+    onUpdateCustomDockXml: (String) -> Unit,
+    onOpenDockXmlEditor: () -> Unit,
     onOpenWidgetsAndFoldersPicker: () -> Unit,
     onOpenMtzStudio: () -> Unit,
     onOpenApiPipeline: () -> Unit,
     onOpenSettings: () -> Unit,
     onSetDefaultHomeLauncher: () -> Unit,
     onPickCustomWallpaper: () -> Unit,
-    onResetToThemeWallpaper: () -> Unit
+    onResetToThemeWallpaper: () -> Unit,
+    onToggleMtzWidgetStyling: (Boolean) -> Unit = {},
+    onToggleWorkspaceNotificationDots: (Boolean) -> Unit = {},
+    onOpenNotificationAccessSettings: () -> Unit = {}
 ) {
     ModalBottomSheet(
         onDismissRequest = onDismiss,
@@ -2189,6 +2451,7 @@ private fun DesktopOptionsBottomSheet(
         Column(
             modifier = Modifier
                 .fillMaxWidth()
+                .verticalScroll(rememberScrollState())
                 .padding(horizontal = 20.dp, vertical = 8.dp)
                 .testTag("desktop_options_sheet"),
             verticalArrangement = Arrangement.spacedBy(12.dp)
@@ -2206,7 +2469,7 @@ private fun DesktopOptionsBottomSheet(
                         fontWeight = FontWeight.Bold
                     )
                     Text(
-                        text = "Customize themes, wallpapers, folders, and icon pipeline",
+                        text = "Customize themes, wallpapers, dock XML, folders, and pipeline",
                         style = MaterialTheme.typography.bodySmall,
                         color = TextSecondary
                     )
@@ -2240,6 +2503,69 @@ private fun DesktopOptionsBottomSheet(
                             modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
                         )
                     }
+                }
+            }
+
+            HorizontalDivider(color = SlateBorder)
+
+            // Dock XML Customization (<DockConfig>) Preset Selector + Live XML Editor
+            DockXmlPresetSelectorSection(
+                customDockXml = engineConfig.customDockXml,
+                effectiveDockConfig = effectiveDockConfig,
+                onUpdateCustomDockXml = onUpdateCustomDockXml,
+                onOpenXmlEditorModal = onOpenDockXmlEditor
+            )
+
+            HorizontalDivider(color = SlateBorder)
+
+            // Optional MTZ Theme Visual Styling for MIUI Widgets & Workspace/Dock Notification Dots
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = "MTZ Theme Visual Styling for MIUI Widgets",
+                            style = MaterialTheme.typography.labelLarge,
+                            color = TextPrimary
+                        )
+                        Text(
+                            text = "Apply .mtz clock/weather assets, custom fonts, images, palette & borders",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = TextSecondary
+                        )
+                    }
+                    Switch(
+                        checked = engineConfig.enableMtzWidgetStyling,
+                        onCheckedChange = onToggleMtzWidgetStyling,
+                        modifier = Modifier.testTag("sheet_toggle_mtz_widget_styling")
+                    )
+                }
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = "Workspace & Dock Notification Badges",
+                            style = MaterialTheme.typography.labelLarge,
+                            color = TextPrimary
+                        )
+                        Text(
+                            text = "Notification count badges (e.g. 20) & dots on Workspace & Dock only (excludes Drawer)",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = TextSecondary
+                        )
+                    }
+                    Switch(
+                        checked = engineConfig.enableWorkspaceNotificationDots,
+                        onCheckedChange = onToggleWorkspaceNotificationDots,
+                        modifier = Modifier.testTag("sheet_toggle_workspace_notification_dots")
+                    )
                 }
             }
 
@@ -2352,6 +2678,116 @@ private fun DesktopOptionsBottomSheet(
                         inactiveTrackColor = SlateSurfaceElevated
                     )
                 )
+            }
+
+            // Drawer & Folder Shade Opacity Slider
+            Column {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Text(
+                        text = "Drawer & Folder Shade Opacity",
+                        style = MaterialTheme.typography.labelLarge,
+                        color = TextPrimary
+                    )
+                    Text(
+                        text = "${(engineConfig.overlayShadeAlpha * 100).roundToInt()}%",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = EmeraldBright
+                    )
+                }
+                Slider(
+                    value = engineConfig.overlayShadeAlpha.coerceIn(0f, 0.95f),
+                    onValueChange = onUpdateOverlayShadeAlpha,
+                    valueRange = 0f..0.95f,
+                    colors = SliderDefaults.colors(
+                        thumbColor = EmeraldBright,
+                        activeTrackColor = EmeraldPrimary,
+                        inactiveTrackColor = SlateSurfaceElevated
+                    ),
+                    modifier = Modifier.testTag("quick_shade_opacity_slider")
+                )
+            }
+
+            // Background Blur Selector (Off, Light, Medium, Heavy)
+            Column {
+                Text(
+                    text = "Background Blur (Drawer & Open Folder)",
+                    style = MaterialTheme.typography.labelLarge,
+                    color = TextPrimary
+                )
+                Spacer(modifier = Modifier.height(6.dp))
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    MiuiBackgroundBlurMode.entries.forEach { blurMode ->
+                        val selected = engineConfig.backgroundBlurMode == blurMode
+                        Surface(
+                            color = if (selected) EmeraldContainer else SlateSurfaceElevated,
+                            shape = RoundedCornerShape(10.dp),
+                            modifier = Modifier
+                                .weight(1f)
+                                .border(
+                                    width = if (selected) 1.5.dp else 1.dp,
+                                    color = if (selected) EmeraldBright else SlateBorder,
+                                    shape = RoundedCornerShape(10.dp)
+                                )
+                                .clip(RoundedCornerShape(10.dp))
+                                .clickable { onUpdateBackgroundBlurMode(blurMode) }
+                                .testTag("quick_blur_mode_${blurMode.code}")
+                        ) {
+                            Text(
+                                text = blurMode.displayName,
+                                style = MaterialTheme.typography.labelMedium,
+                                color = if (selected) EmeraldBright else TextPrimary,
+                                textAlign = TextAlign.Center,
+                                modifier = Modifier.padding(vertical = 9.dp)
+                            )
+                        }
+                    }
+                }
+            }
+
+            // Folder Open Animation Selector (MIUI Zoom Expand, Smooth Fade, Off)
+            Column {
+                Text(
+                    text = "Folder Open Animation",
+                    style = MaterialTheme.typography.labelLarge,
+                    color = TextPrimary
+                )
+                Spacer(modifier = Modifier.height(6.dp))
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    MiuiFolderAnimationMode.entries.forEach { animMode ->
+                        val selected = engineConfig.folderAnimationMode == animMode
+                        Surface(
+                            color = if (selected) EmeraldContainer else SlateSurfaceElevated,
+                            shape = RoundedCornerShape(10.dp),
+                            modifier = Modifier
+                                .weight(1f)
+                                .border(
+                                    width = if (selected) 1.5.dp else 1.dp,
+                                    color = if (selected) EmeraldBright else SlateBorder,
+                                    shape = RoundedCornerShape(10.dp)
+                                )
+                                .clip(RoundedCornerShape(10.dp))
+                                .clickable { onUpdateFolderAnimationMode(animMode) }
+                                .testTag("quick_folder_anim_${animMode.code}")
+                        ) {
+                            Text(
+                                text = animMode.displayName,
+                                style = MaterialTheme.typography.labelSmall,
+                                color = if (selected) EmeraldBright else TextPrimary,
+                                textAlign = TextAlign.Center,
+                                modifier = Modifier.padding(vertical = 9.dp, horizontal = 4.dp)
+                            )
+                        }
+                    }
+                }
             }
 
             // Wallpaper Selection Strip

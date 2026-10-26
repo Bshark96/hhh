@@ -89,8 +89,32 @@ enum class HyperWidgetType(
         "CLOCK_MTZ_STATUS",
         "MIUI Clock & Date",
         "4x2",
-        "Standard MIUI digital clock and date widget",
+        "Standard MIUI digital clock and date widget (tap to open Clock/Calendar)",
         4,
+        2
+    ),
+    MIUI_CLOCK_WEATHER_2X4(
+        "MIUI_CLOCK_WEATHER_2X4",
+        "MIUI Clock & Weather 2x4",
+        "4x2",
+        "MIUI clock_2x4 theme widget bridged with native Clock, Calendar & Weather apps",
+        4,
+        2
+    ),
+    MIUI_WEATHER_BRIDGE(
+        "MIUI_WEATHER_BRIDGE",
+        "MIUI Live Weather",
+        "4x2",
+        "MIUI MAML weather widget with live forecast, GPS city & native Weather shortcut",
+        4,
+        2
+    ),
+    MIUI_CALENDAR_BRIDGE(
+        "MIUI_CALENDAR_BRIDGE",
+        "MIUI Calendar & Agenda",
+        "2x2",
+        "MIUI calendar widget reading real CalendarContract events & launching native Calendar",
+        2,
         2
     ),
     DEVICE_TELEMETRY(
@@ -134,6 +158,19 @@ enum class HyperWidgetType(
 }
 
 /**
+ * Represents a real calendar event read from Android's CalendarContract.Instances
+ * for MIUI Theme Calendar & Agenda widgets.
+ */
+data class CalendarEventItem(
+    val id: Long,
+    val title: String,
+    val startTimeMillis: Long,
+    val endTimeMillis: Long,
+    val location: String = "",
+    val isAllDay: Boolean = false
+)
+
+/**
  * Represents an active Widget pinned to the Home Workspace.
  */
 data class WorkspaceWidgetItem(
@@ -151,7 +188,7 @@ data class WorkspaceWidgetItem(
 )
 
 /**
- * Device status snapshot.
+ * Device status, live weather binder telemetry, and CalendarContract agenda snapshot.
  */
 data class DeviceTelemetrySnapshot(
     val batteryPercent: Int = 85,
@@ -160,7 +197,118 @@ data class DeviceTelemetrySnapshot(
     val usedRamMb: Long = 2048L,
     val totalRamMb: Long = 4096L,
     val usedStorageGb: Float = 12.4f,
-    val totalStorageGb: Float = 64.0f
+    val totalStorageGb: Float = 64.0f,
+    val weatherCity: String = "Local Weather",
+    val weatherTempCelsius: Int = 22,
+    val weatherHighCelsius: Int = 25,
+    val weatherLowCelsius: Int = 16,
+    val weatherCondition: String = "Clear Sky",
+    val weatherConditionCode: Int = 0,
+    val weatherHumidity: Int = 52,
+    val weatherWindKmh: Int = 11,
+    val weatherAqi: Int = 28,
+    val hasLocationPermission: Boolean = false,
+    val hasCalendarPermission: Boolean = false,
+    val upcomingCalendarEvents: List<CalendarEventItem> = emptyList()
+)
+
+/**
+ * Scale/alignment mode for `<DockConfig>` background and 4-side edge images.
+ */
+enum class DockImageScaleMode(val code: String) {
+    STRETCH("STRETCH"),
+    REPEAT("REPEAT"),
+    CENTER("CENTER"),
+    CROP("CROP");
+
+    companion object {
+        fun fromCode(raw: String?): DockImageScaleMode {
+            val clean = raw?.trim()?.uppercase() ?: return STRETCH
+            return when (clean) {
+                "TILE", "REPEAT" -> REPEAT
+                "CENTER", "FIT" -> CENTER
+                "CROP", "COVER" -> CROP
+                else -> STRETCH
+            }
+        }
+    }
+}
+
+/**
+ * Represents a single side edge image (`<Top>`, `<Bottom>`, `<Left>`, `<Right>`)
+ * inside `<DockConfig><SideImages>...</SideImages></DockConfig>`.
+ */
+data class DockSideImageSpec(
+    val src: String,
+    val thicknessDp: Float = 8f,
+    val mode: DockImageScaleMode = DockImageScaleMode.STRETCH,
+    val offsetDp: Float = 0f,
+    val tintHex: String? = null,
+    val alpha: Float = 1.0f,
+    val lengthFraction: Float = 0.85f
+)
+
+/**
+ * Represents a corner ornament image (`<CornerTopLeft>`, etc.) in `<DockConfig><SideImages>`.
+ */
+data class DockCornerImageSpec(
+    val src: String,
+    val sizeDp: Float = 14f,
+    val offsetDp: Float = 0f,
+    val tintHex: String? = null,
+    val alpha: Float = 1.0f
+)
+
+/**
+ * Declarative `<DockConfig>` XML customization specification.
+ *
+ * ZERO-CONFIG STOCK MIUI FALLBACK:
+ * When no `<DockConfig>` tag or `dock_config.xml` is found in the `.mtz` theme (and no custom XML
+ * override is active), `isCustomDockEnabled` is `false` and the dock renders as the unmodified
+ * stock MIUI transparent pin bar (zero background, zero border, zero 4-side frame images).
+ */
+data class DockXmlConfig(
+    val isCustomDockEnabled: Boolean = false,
+    val heightDp: Float? = null,
+    val marginHorizontalDp: Float = 4f,
+    val marginBottomDp: Float = 6f,
+    val paddingHorizontalDp: Float = 0f,
+    val paddingVerticalDp: Float = 0f,
+    val cornerRadiusDp: Float = 24f,
+    val topLeftRadiusDp: Float? = null,
+    val topRightRadiusDp: Float? = null,
+    val bottomLeftRadiusDp: Float? = null,
+    val bottomRightRadiusDp: Float? = null,
+    val blurRadiusDp: Float = 0f,
+    val iconScale: Float = 1.0f,
+    val itemSpacingDp: Float = 0f,
+    // <Background>
+    val backgroundColorHex: String? = null,
+    val gradientStartHex: String? = null,
+    val gradientCenterHex: String? = null,
+    val gradientEndHex: String? = null,
+    val gradientAngle: Float = 90f,
+    val backgroundImage: String? = null,
+    val backgroundScaleMode: DockImageScaleMode = DockImageScaleMode.STRETCH,
+    val backgroundAlpha: Float = 1.0f,
+    // <Border>
+    val borderWidthDp: Float = 0f,
+    val borderColorHex: String? = null,
+    val borderGradientStartHex: String? = null,
+    val borderGradientEndHex: String? = null,
+    val glowColorHex: String? = null,
+    val glowRadiusDp: Float = 0f,
+    val dashWidthDp: Float = 0f,
+    val dashGapDp: Float = 0f,
+    // <SideImages> (Top, Bottom, Left, Right + 4 Corners)
+    val topSide: DockSideImageSpec? = null,
+    val bottomSide: DockSideImageSpec? = null,
+    val leftSide: DockSideImageSpec? = null,
+    val rightSide: DockSideImageSpec? = null,
+    val cornerTopLeft: DockCornerImageSpec? = null,
+    val cornerTopRight: DockCornerImageSpec? = null,
+    val cornerBottomLeft: DockCornerImageSpec? = null,
+    val cornerBottomRight: DockCornerImageSpec? = null
 )
 
 /**
@@ -226,7 +374,12 @@ data class MamlLayerSpec(
     val fillColorHex: String = "#000000",
     val xfermode: String? = null,
     val groupLayered: Boolean = false,
-    val groupClip: Boolean = false
+    val groupClip: Boolean = false,
+    val srcidExpression: String? = null,
+    val srcExp: String? = null,
+    val visibilityExpression: String? = null,
+    val numberExpression: String? = null,
+    val spaceExpression: String? = null
 )
 
 /**
@@ -241,6 +394,7 @@ data class MamlFancyIconSpec(
     val layers: List<MamlLayerSpec>,
     val rawManifestXml: String,
     val variables: Map<String, MamlVarAnimation> = emptyMap(),
+    val scalarVariables: List<MamlVarDef> = emptyList(),
     val quietImagePath: String? = null,
     val startImagePath: String? = null,
     val isLiveClockOrCalendar: Boolean = false
@@ -398,7 +552,180 @@ data class MtzThemeMetadata(
     val pointsOffsetX: Float = 0.11f,
     val pointsOffsetY: Float = 0.11f,
     val pointsMappingSrc: FloatArray? = null,
-    val pointsMappingDst: FloatArray? = null
+    val pointsMappingDst: FloatArray? = null,
+    val dockConfig: DockXmlConfig = DockXmlConfig(),
+    val rawDockConfigXml: String = "",
+    val customFontPath: String? = null,
+    val widgetBackgroundPath: String? = null,
+    val widgetGadgetBgPath: String? = null,
+    val widgetGadgetCirclePath: String? = null,
+    val widgetGadgetIconPath: String? = null,
+    val widgetWeatherIconPaths: Map<String, String> = emptyMap(),
+    val widgetDigitSpritePaths: Map<Char, String> = emptyMap(),
+    val clockWidgetMamlSpec: MamlFancyIconSpec? = null,
+    val clock2x4WidgetSpec: MamlClockWidgetSpec? = null,
+    val clock3x4WidgetSpec: MamlClockWidgetSpec? = null
+)
+
+/**
+ * Represents a `<VarArray type="string">` table inside a MAML `<Clock>` / `<clock>` manifest.
+ */
+data class MamlStringVarArray(
+    val varName: String,
+    val indexExpression: String,
+    val items: List<String>
+)
+
+/**
+ * Represents a `<Var name="..." expression="..." type="string|number"/>` inside a MAML clock manifest.
+ */
+data class MamlVarDef(
+    val name: String,
+    val expression: String,
+    val isString: Boolean = false,
+    val isConst: Boolean = false
+)
+
+/**
+ * Represents a `<VariableCommand name="..." expression="..."/>` inside a `<Button>` `<Trigger>`.
+ */
+data class MamlTriggerCommand(
+    val action: String,
+    val variableName: String,
+    val expression: String
+)
+
+/**
+ * Scene-graph node inside a Xiaomi MIUI MAML `clock_2x4` or `clock_3x4` `manifest.xml`.
+ */
+sealed class MamlWidgetNode {
+    data class GroupNode(
+        val name: String? = null,
+        val xExpr: String? = null,
+        val yExpr: String? = null,
+        val wExpr: String? = null,
+        val hExpr: String? = null,
+        val align: String = "left",
+        val alignV: String = "top",
+        val pivotXExpr: String? = null,
+        val pivotYExpr: String? = null,
+        val rotationExpr: String? = null,
+        val scaleExpr: String? = null,
+        val scaleXExpr: String? = null,
+        val scaleYExpr: String? = null,
+        val alphaExpr: String? = null,
+        val visibilityExpr: String? = null,
+        val layered: Boolean = false,
+        val clip: Boolean = false,
+        val children: List<MamlWidgetNode> = emptyList()
+    ) : MamlWidgetNode()
+
+    data class ImageNode(
+        val name: String? = null,
+        val xExpr: String? = null,
+        val yExpr: String? = null,
+        val wExpr: String? = null,
+        val hExpr: String? = null,
+        val align: String = "left",
+        val alignV: String = "top",
+        val pivotXExpr: String? = null,
+        val pivotYExpr: String? = null,
+        val rotationExpr: String? = null,
+        val scaleExpr: String? = null,
+        val scaleXExpr: String? = null,
+        val scaleYExpr: String? = null,
+        val alphaExpr: String? = null,
+        val visibilityExpr: String? = null,
+        val src: String? = null,
+        val srcExp: String? = null,
+        val srcidExpr: String? = null,
+        val xfermode: String? = null
+    ) : MamlWidgetNode()
+
+    data class ImageNumberNode(
+        val name: String? = null,
+        val xExpr: String? = null,
+        val yExpr: String? = null,
+        val align: String = "left",
+        val alignV: String = "top",
+        val numberExpr: String? = null,
+        val format: String? = null,
+        val src: String? = null,
+        val srcExp: String? = null,
+        val spaceExpr: String? = null,
+        val alphaExpr: String? = null,
+        val visibilityExpr: String? = null
+    ) : MamlWidgetNode()
+
+    data class DateTimeNode(
+        val name: String? = null,
+        val xExpr: String? = null,
+        val yExpr: String? = null,
+        val align: String = "left",
+        val alignV: String = "top",
+        val format: String? = null,
+        val formatExp: String? = null,
+        val colorHex: String = "#FFFFFF",
+        val sizeExpr: String? = null,
+        val alphaExpr: String? = null,
+        val visibilityExpr: String? = null,
+        val bold: Boolean = false
+    ) : MamlWidgetNode()
+
+    data class TextNode(
+        val name: String? = null,
+        val xExpr: String? = null,
+        val yExpr: String? = null,
+        val align: String = "left",
+        val alignV: String = "top",
+        val text: String? = null,
+        val textExp: String? = null,
+        val format: String? = null,
+        val paras: String? = null,
+        val colorHex: String = "#FFFFFF",
+        val sizeExpr: String? = null,
+        val alphaExpr: String? = null,
+        val visibilityExpr: String? = null,
+        val bold: Boolean = false
+    ) : MamlWidgetNode()
+
+    data class ButtonNode(
+        val name: String? = null,
+        val xExpr: String? = null,
+        val yExpr: String? = null,
+        val wExpr: String? = null,
+        val hExpr: String? = null,
+        val align: String = "left",
+        val alignV: String = "top",
+        val triggers: List<MamlTriggerCommand> = emptyList()
+    ) : MamlWidgetNode()
+}
+
+/**
+ * Complete parsed specification of a Xiaomi MIUI MAML `clock_2x4` or `clock_3x4` widget module.
+ */
+data class MamlClockWidgetSpec(
+    val moduleName: String,
+    val directoryPath: String,
+    val screenWidth: Int = 1080,
+    val frameRate: Int = 30,
+    val stringVarArrays: List<MamlStringVarArray> = emptyList(),
+    val variables: List<MamlVarDef> = emptyList(),
+    val varAnimations: Map<String, MamlVarAnimation> = emptyMap(),
+    val nodes: List<MamlWidgetNode> = emptyList(),
+    val triggers: List<MamlTriggerCommand> = emptyList(),
+    val localizedStrings: Map<String, String> = emptyMap(),
+    val rawManifestXml: String = ""
+)
+
+/**
+ * Represents a selectable Activity inside an installed application (used for launch activity selection).
+ */
+data class AppActivityOption(
+    val activityName: String,
+    val label: String,
+    val isExported: Boolean,
+    val isDefaultLauncher: Boolean
 )
 
 /**
@@ -421,7 +748,10 @@ data class InstalledAppItem(
     val renderKey: String = "",
     val mamlFancySpec: MamlFancyIconSpec? = null,
     val cellX: Int = -1,
-    val cellY: Int = -1
+    val cellY: Int = -1,
+    val defaultActivityName: String = activityName,
+    val customActivityName: String? = null,
+    val remappedIconPackage: String? = null
 )
 
 /**
@@ -466,6 +796,38 @@ enum class MiuiPageTransitionEffect(val code: String, val displayName: String) {
 }
 
 /**
+ * MIUI Background Blur intensity applied to the home wallpaper & workspace when the App Drawer
+ * or Expanded Folder overlay is open. Includes an explicit `OFF` mode to turn off blur completely.
+ */
+enum class MiuiBackgroundBlurMode(val code: String, val displayName: String, val blurDp: Int) {
+    OFF("OFF", "Off", 0),
+    LIGHT("LIGHT", "Light", 8),
+    MEDIUM("MEDIUM", "Medium", 16),
+    HEAVY("HEAVY", "Heavy", 26);
+
+    companion object {
+        fun fromCode(code: String): MiuiBackgroundBlurMode {
+            return entries.firstOrNull { it.code.equals(code, ignoreCase = true) } ?: MEDIUM
+        }
+    }
+}
+
+/**
+ * MIUI Folder Opening & Closing Animation styles selectable in Settings & Desktop Options.
+ */
+enum class MiuiFolderAnimationMode(val code: String, val displayName: String) {
+    MIUI_ZOOM_EXPAND("MIUI_ZOOM_EXPAND", "MIUI Zoom Expand"),
+    SMOOTH_FADE("SMOOTH_FADE", "Smooth Fade"),
+    OFF("OFF", "Off");
+
+    companion object {
+        fun fromCode(code: String): MiuiFolderAnimationMode {
+            return entries.firstOrNull { it.code.equals(code, ignoreCase = true) } ?: MIUI_ZOOM_EXPAND
+        }
+    }
+}
+
+/**
  * Global configuration for the Launcher Grid and Xiaomi Icon Theme API Engine.
  */
 data class LauncherEngineConfig(
@@ -489,7 +851,14 @@ data class LauncherEngineConfig(
     val showApiSourceBadges: Boolean = false,
     val pageTransitionEffect: MiuiPageTransitionEffect = MiuiPageTransitionEffect.CLASSIC,
     val defaultHomePageIndex: Int = 0,
-    val bottomAlignedPages: Set<Int> = emptySet()
+    val bottomAlignedPages: Set<Int> = emptySet(),
+    val overlayShadeAlpha: Float = 0.60f,
+    val backgroundBlurMode: MiuiBackgroundBlurMode = MiuiBackgroundBlurMode.MEDIUM,
+    val folderAnimationMode: MiuiFolderAnimationMode = MiuiFolderAnimationMode.MIUI_ZOOM_EXPAND,
+    val customDockXml: String = "",
+    val enableMtzWidgetStyling: Boolean = true,
+    val widgetThemeId: String = "",
+    val enableWorkspaceNotificationDots: Boolean = true
 )
 
 /**

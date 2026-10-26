@@ -31,13 +31,24 @@ import androidx.compose.material3.Switch
 import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
+import com.example.domain.model.DeviceTelemetrySnapshot
+import com.example.domain.model.DockXmlConfig
 import com.example.domain.model.LauncherEngineConfig
+import com.example.domain.model.MiuiBackgroundBlurMode
+import com.example.domain.model.MiuiFolderAnimationMode
+import com.example.ui.components.DockXmlLiveEditorDialog
+import com.example.ui.components.DockXmlPresetSelectorSection
 import com.example.ui.theme.EmeraldBright
 import com.example.ui.theme.EmeraldContainer
 import com.example.ui.theme.EmeraldPrimary
@@ -47,10 +58,13 @@ import com.example.ui.theme.SlateSurface
 import com.example.ui.theme.SlateSurfaceElevated
 import com.example.ui.theme.TextPrimary
 import com.example.ui.theme.TextSecondary
+import kotlin.math.roundToInt
 
 @Composable
 fun LauncherSettingsScreen(
     engineConfig: LauncherEngineConfig,
+    effectiveDockConfig: DockXmlConfig = DockXmlConfig(isCustomDockEnabled = false),
+    deviceTelemetry: DeviceTelemetrySnapshot = DeviceTelemetrySnapshot(),
     onSetDefaultHomeLauncher: () -> Unit,
     onUpdateGridColumns: (Int) -> Unit,
     onUpdateGridRows: (Int) -> Unit = {},
@@ -58,9 +72,29 @@ fun LauncherSettingsScreen(
     onToggleShowLabels: (Boolean) -> Unit,
     onToggleShowApiBadges: (Boolean) -> Unit,
     onToggleMultiBgHash: (Boolean) -> Unit,
+    onUpdateOverlayShadeAlpha: (Float) -> Unit = {},
+    onUpdateBackgroundBlurMode: (MiuiBackgroundBlurMode) -> Unit = {},
+    onUpdateFolderAnimationMode: (MiuiFolderAnimationMode) -> Unit = {},
+    onUpdateCustomDockXml: (String) -> Unit = {},
+    onRequestWidgetPermissions: () -> Unit = {},
+    isNotificationAccessGranted: Boolean = false,
+    onToggleMtzWidgetStyling: (Boolean) -> Unit = {},
+    onToggleWorkspaceNotificationDots: (Boolean) -> Unit = {},
+    onOpenNotificationAccessSettings: () -> Unit = {},
     onCloseSettings: () -> Unit = {}
 ) {
     BackHandler(onBack = onCloseSettings)
+    var showDockXmlLiveEditor by remember { mutableStateOf(false) }
+
+    if (showDockXmlLiveEditor) {
+        DockXmlLiveEditorDialog(
+            initialXml = engineConfig.customDockXml,
+            themeDefaultXml = "",
+            onDismiss = { showDockXmlLiveEditor = false },
+            onApplyXml = onUpdateCustomDockXml
+        )
+    }
+
     LazyColumn(
         modifier = Modifier
             .fillMaxSize()
@@ -83,7 +117,7 @@ fun LauncherSettingsScreen(
                         color = TextPrimary
                     )
                     Text(
-                        text = "Configure desktop grid, icons, and system default home launcher",
+                        text = "Configure desktop grid, icons, <DockConfig> XML, and MIUI widget permissions",
                         style = MaterialTheme.typography.bodySmall,
                         color = TextSecondary
                     )
@@ -145,6 +179,118 @@ fun LauncherSettingsScreen(
                             text = "Set as Default Home Launcher",
                             fontWeight = FontWeight.Bold
                         )
+                    }
+                }
+            }
+        }
+
+        // <DockConfig> XML Customization Card
+        item {
+            Surface(
+                color = SlateSurface,
+                shape = RoundedCornerShape(16.dp),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .border(1.dp, SlateBorder, RoundedCornerShape(16.dp))
+            ) {
+                Column(modifier = Modifier.padding(16.dp)) {
+                    Text(
+                        text = "Dock Customization XML API (<DockConfig>)",
+                        style = MaterialTheme.typography.titleMedium,
+                        color = EmeraldBright
+                    )
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Text(
+                        text = if (effectiveDockConfig.isCustomDockEnabled) {
+                            "Active: Custom <DockConfig> enabled (Background, Border & 4-Side Frame Images). Clear to restore stock MIUI transparent dock."
+                        } else {
+                            "Stock MIUI Fallback Active: No <DockConfig> modification found in XML — rendering unmodified transparent MIUI pin bar."
+                        },
+                        style = MaterialTheme.typography.bodySmall,
+                        color = TextSecondary
+                    )
+                    Spacer(modifier = Modifier.height(10.dp))
+                    DockXmlPresetSelectorSection(
+                        customDockXml = engineConfig.customDockXml,
+                        effectiveDockConfig = effectiveDockConfig,
+                        onUpdateCustomDockXml = onUpdateCustomDockXml,
+                        onOpenXmlEditorModal = { showDockXmlLiveEditor = true }
+                    )
+                }
+            }
+        }
+
+        // MIUI Theme Widgets & Native Bridge Permissions Card
+        item {
+            Surface(
+                color = SlateSurface,
+                shape = RoundedCornerShape(16.dp),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .border(1.dp, SlateBorder, RoundedCornerShape(16.dp))
+            ) {
+                Column(modifier = Modifier.padding(16.dp)) {
+                    Text(
+                        text = "MIUI Theme Widgets & Native App Bridges",
+                        style = MaterialTheme.typography.titleMedium,
+                        color = TextPrimary
+                    )
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Text(
+                        text = "Location: ${if (deviceTelemetry.hasLocationPermission) "Granted (${deviceTelemetry.weatherCity})" else "Not granted"} • Calendar: ${if (deviceTelemetry.hasCalendarPermission) "Granted (${deviceTelemetry.upcomingCalendarEvents.size} events)" else "Not granted"}",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = EmeraldBright
+                    )
+                    Spacer(modifier = Modifier.height(10.dp))
+                    Button(
+                        onClick = onRequestWidgetPermissions,
+                        colors = ButtonDefaults.buttonColors(containerColor = EmeraldPrimary),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("settings_grant_widget_permissions_btn")
+                    ) {
+                        Text(
+                            text = "Grant Location & Calendar Permissions for MIUI Widgets",
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
+
+                    Spacer(modifier = Modifier.height(10.dp))
+                    HorizontalDivider(color = SlateBorder)
+                    Spacer(modifier = Modifier.height(6.dp))
+
+                    SettingsSwitchItem(
+                        title = "Use .MTZ Theme Visual Styling for MIUI Widgets (Optional)",
+                        subtitle = "Applies extracted .mtz clock/weather assets, custom images, custom fonts (.ttf/.otf), theme palette & borders",
+                        checked = engineConfig.enableMtzWidgetStyling,
+                        onCheckedChange = onToggleMtzWidgetStyling,
+                        tag = "toggle_mtz_widget_styling"
+                    )
+
+                    SettingsSwitchItem(
+                        title = "Workspace & Dock Notification Badges (Count & Dot, Excludes Drawer)",
+                        subtitle = "Shows notification count badges (e.g. 20) & dots on Workspace & Dock icons only (App Drawer stays badge-free)",
+                        checked = engineConfig.enableWorkspaceNotificationDots,
+                        onCheckedChange = onToggleWorkspaceNotificationDots,
+                        tag = "toggle_workspace_notification_dots"
+                    )
+
+                    if (!isNotificationAccessGranted) {
+                        Spacer(modifier = Modifier.height(6.dp))
+                        Button(
+                            onClick = onOpenNotificationAccessSettings,
+                            colors = ButtonDefaults.buttonColors(containerColor = SlateSurfaceElevated),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .border(1.dp, EmeraldBright, RoundedCornerShape(24.dp))
+                                .testTag("settings_grant_notification_listener_btn")
+                        ) {
+                            Text(
+                                text = "Grant Notification Access for Workspace & Dock Badges",
+                                color = EmeraldBright,
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
                     }
                 }
             }
@@ -298,6 +444,129 @@ fun LauncherSettingsScreen(
             }
         }
 
+        // Drawer & Folder Shade, Background Blur, and Folder Open Animation Card
+        item {
+            Surface(
+                color = SlateSurface,
+                shape = RoundedCornerShape(16.dp),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .border(1.dp, SlateBorder, RoundedCornerShape(16.dp))
+            ) {
+                Column(modifier = Modifier.padding(16.dp)) {
+                    Text(
+                        text = "Drawer & Folder Overlay Shade, Blur & Animations",
+                        style = MaterialTheme.typography.titleMedium,
+                        color = TextPrimary
+                    )
+                    Spacer(modifier = Modifier.height(10.dp))
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Text(
+                            text = "Drawer & Folder Shade Opacity",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = TextPrimary
+                        )
+                        Text(
+                            text = "${(engineConfig.overlayShadeAlpha * 100).roundToInt()}%",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = EmeraldBright
+                        )
+                    }
+                    Slider(
+                        value = engineConfig.overlayShadeAlpha.coerceIn(0f, 0.95f),
+                        onValueChange = onUpdateOverlayShadeAlpha,
+                        valueRange = 0f..0.95f,
+                        colors = SliderDefaults.colors(
+                            thumbColor = EmeraldBright,
+                            activeTrackColor = EmeraldPrimary,
+                            inactiveTrackColor = SlateSurfaceElevated
+                        ),
+                        modifier = Modifier.testTag("overlay_shade_alpha_slider")
+                    )
+
+                    Spacer(modifier = Modifier.height(10.dp))
+                    Text(
+                        text = "Background Blur (Drawer & Open Folder)",
+                        style = MaterialTheme.typography.labelLarge,
+                        color = TextSecondary
+                    )
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        MiuiBackgroundBlurMode.entries.forEach { blurMode ->
+                            val selected = engineConfig.backgroundBlurMode == blurMode
+                            Surface(
+                                color = if (selected) EmeraldContainer else SlateSurfaceElevated,
+                                shape = RoundedCornerShape(10.dp),
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .border(
+                                        width = if (selected) 1.5.dp else 1.dp,
+                                        color = if (selected) EmeraldBright else SlateBorder,
+                                        shape = RoundedCornerShape(10.dp)
+                                    )
+                                    .clip(RoundedCornerShape(10.dp))
+                                    .clickable { onUpdateBackgroundBlurMode(blurMode) }
+                                    .testTag("blur_mode_${blurMode.code}")
+                            ) {
+                                Text(
+                                    text = blurMode.displayName,
+                                    style = MaterialTheme.typography.labelMedium,
+                                    color = if (selected) EmeraldBright else TextPrimary,
+                                    textAlign = TextAlign.Center,
+                                    modifier = Modifier.padding(vertical = 10.dp, horizontal = 4.dp)
+                                )
+                            }
+                        }
+                    }
+
+                    Spacer(modifier = Modifier.height(14.dp))
+                    Text(
+                        text = "Folder Open Animation",
+                        style = MaterialTheme.typography.labelLarge,
+                        color = TextSecondary
+                    )
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        MiuiFolderAnimationMode.entries.forEach { animMode ->
+                            val selected = engineConfig.folderAnimationMode == animMode
+                            Surface(
+                                color = if (selected) EmeraldContainer else SlateSurfaceElevated,
+                                shape = RoundedCornerShape(10.dp),
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .border(
+                                        width = if (selected) 1.5.dp else 1.dp,
+                                        color = if (selected) EmeraldBright else SlateBorder,
+                                        shape = RoundedCornerShape(10.dp)
+                                    )
+                                    .clip(RoundedCornerShape(10.dp))
+                                    .clickable { onUpdateFolderAnimationMode(animMode) }
+                                    .testTag("folder_anim_mode_${animMode.code}")
+                            ) {
+                                Text(
+                                    text = animMode.displayName,
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = if (selected) EmeraldBright else TextPrimary,
+                                    textAlign = TextAlign.Center,
+                                    modifier = Modifier.padding(vertical = 10.dp, horizontal = 4.dp)
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // Architectural Reference Card
         item {
             Surface(
@@ -318,7 +587,8 @@ fun LauncherSettingsScreen(
                         text = "1. Archive Structure: Outer .mtz/.mtx ZIP containing description.xml, wallpaper/, and an inner 'icons' ZIP payload.\n" +
                             "2. Direct Mapping: res/drawable-xxhdpi/<package_or_component>.png matched against PackageManager activities and Xiaomi package aliases.\n" +
                             "3. Dynamic Masking API: Unthemed apps are scaled by <dimen name=\"icon_scale\"> from theme_values.xml, clipped against icon_mask.png using PorterDuff.Mode.DST_IN, placed over icon_bg.png, and framed by icon_border.png.\n" +
-                            "4. MAML fancy_icons: Evaluates fancy_icons/<pkg>/manifest.xml expressions (#hour12, #minute, #second, #date) for live dynamic icons.",
+                            "4. MAML fancy_icons: Evaluates fancy_icons/<pkg>/manifest.xml expressions (#hour12, #minute, #second, #date) for live dynamic icons.\n" +
+                            "5. <DockConfig> XML API: Customizes dock background, borders, and 4-side/4-corner frame images when present in dock_config.xml or transform_config.xml, or falls back to the unmodified stock MIUI transparent pin bar when omitted.",
                         style = MaterialTheme.typography.bodySmall,
                         color = TextSecondary
                     )

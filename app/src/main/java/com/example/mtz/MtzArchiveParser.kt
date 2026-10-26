@@ -4,6 +4,10 @@ import android.graphics.BitmapFactory
 import android.graphics.Color
 import android.util.Xml
 import com.example.domain.model.ColorSplashMode
+import com.example.domain.model.DockCornerImageSpec
+import com.example.domain.model.DockImageScaleMode
+import com.example.domain.model.DockSideImageSpec
+import com.example.domain.model.DockXmlConfig
 import com.example.domain.model.MamlAniFrame
 import com.example.domain.model.MamlFancyIconSpec
 import com.example.domain.model.MamlLayerSpec
@@ -37,7 +41,6 @@ class MtzArchiveParser {
             "com.android.updater",
             "com.miui.player",
             "lockscreen",
-            "clock_2x4",
             "miwallpaper"
         )
     }
@@ -74,9 +77,14 @@ class MtzArchiveParser {
 
         while (entry != null) {
             val cleanName = entry.name.removePrefix("/").replace("\\", "/")
-            if (cleanName.isNotEmpty() && !cleanName.contains("..")) {
+            val leafName = cleanName.substringAfterLast('/')
+            val isMacResourceFork = leafName.startsWith("._") ||
+                leafName == ".DS_Store" ||
+                cleanName.contains("__MACOSX/")
+            if (cleanName.isNotEmpty() && !cleanName.contains("..") && !isMacResourceFork) {
                 val shouldSkip = isRootArchive && (
                     cleanName in SKIPPED_TOP_LEVEL_SYSTEM_MODULES ||
+                        cleanName.startsWith("lockscreen", ignoreCase = true) ||
                         cleanName.startsWith("boots/") ||
                         cleanName.startsWith("preview/")
                     )
@@ -95,6 +103,10 @@ class MtzArchiveParser {
                             val homeDir = File(destDir, "com_miui_home_unpacked")
                             homeDir.mkdirs()
                             extractZipStreamRecursive(ByteArrayInputStream(bytes), homeDir, isRootArchive = false)
+                        } else if ((cleanName.startsWith("clock_") || cleanName.startsWith("weather") || cleanName == "fonts") && isZipPayload(bytes)) {
+                            val widgetDir = File(destDir, "${cleanName}_unpacked")
+                            widgetDir.mkdirs()
+                            extractZipStreamRecursive(ByteArrayInputStream(bytes), widgetDir, isRootArchive = false)
                         } else {
                             FileOutputStream(outFile).use { fos ->
                                 fos.write(bytes)
@@ -145,8 +157,27 @@ class MtzArchiveParser {
                 }
             }
         }
+        for (subName in listOf("clock_2x4", "clock_3x4", "clock_2x2", "clock_1x4", "weather", "weather_4x4", "weather_4x1", "fonts")) {
+            val rawZip = File(extractedDir, subName)
+            val unpackedDir = File(extractedDir, "${subName}_unpacked")
+            if (rawZip.isFile && !unpackedDir.exists()) {
+                runCatching {
+                    val bytes = rawZip.readBytes()
+                    if (isZipPayload(bytes)) {
+                        unpackedDir.mkdirs()
+                        extractZipStreamRecursive(ByteArrayInputStream(bytes), unpackedDir, isRootArchive = false)
+                    }
+                }
+            }
+        }
 
-        val allFiles = extractedDir.walkTopDown().filter { it.isFile }.toList()
+        val allFiles = extractedDir.walkTopDown().filter {
+            it.isFile &&
+                !it.name.startsWith("._") &&
+                it.name != ".DS_Store" &&
+                !it.invariantSeparatorsPath.contains("__MACOSX") &&
+                !it.invariantSeparatorsPath.contains("lockscreen", ignoreCase = true)
+        }.toList()
 
         // 1. Parse description.xml
         val descriptionFile = allFiles.firstOrNull {
@@ -192,6 +223,18 @@ class MtzArchiveParser {
         val rawRulesXml = rulesFile?.readText().orEmpty()
         val iconRulesMap = if (rawRulesXml.isNotBlank()) parseIconRulesXml(rawRulesXml) else emptyMap()
 
+        // 3b. Parse dock_config.xml or embedded <DockConfig> inside transform_config.xml
+        val dockConfigFile = allFiles.firstOrNull {
+            it.name.equals("dock_config.xml", ignoreCase = true)
+        }
+        val rawDockConfigXml = dockConfigFile?.readText()?.takeIf { it.isNotBlank() }
+            ?: if (rawTransformXml.contains("<DockConfig", ignoreCase = true)) rawTransformXml else ""
+        val parsedDockConfig = if (rawDockConfigXml.isNotBlank()) {
+            parseDockConfigXml(rawDockConfigXml)
+        } else {
+            DockXmlConfig(isCustomDockEnabled = false)
+        }
+
         // 4. Index Xiaomi Icon API Layer Templates + Direct Package Icons
         val iconBgMap = linkedMapOf<String, String>()
         var iconMaskPath: String? = null
@@ -205,10 +248,13 @@ class MtzArchiveParser {
 
         val imageFiles = allFiles.filter {
             val ext = it.extension.lowercase()
+            val relPath = "/" + it.relativeTo(extractedDir).invariantSeparatorsPath
             (ext == "png" || ext == "webp" || ext == "jpg") &&
-                !it.invariantSeparatorsPath.contains("/fancy_icons/") &&
-                !it.invariantSeparatorsPath.contains("/wallpaper/") &&
-                !it.invariantSeparatorsPath.contains("/preview/")
+                !relPath.contains("/fancy_icons/") &&
+                !relPath.contains("/wallpaper/") &&
+                !relPath.contains("/preview/") &&
+                !relPath.contains("/clock_") &&
+                !relPath.contains("/weather")
         }.sortedBy { densityPriorityOrder(it.invariantSeparatorsPath) }
 
         for (img in imageFiles) {
@@ -274,8 +320,9 @@ class MtzArchiveParser {
         // 5. Parse Xiaomi MAML fancy_icons/<package>/manifest.xml
         val fancyIconSpecs = mutableMapOf<String, MamlFancyIconSpec>()
         val manifestFiles = allFiles.filter {
+            val relPath = it.relativeTo(extractedDir).invariantSeparatorsPath
             it.name.equals("manifest.xml", ignoreCase = true) &&
-                it.invariantSeparatorsPath.contains("fancy_icons")
+                relPath.contains("fancy_icons")
         }
         for (manifestFile in manifestFiles) {
             val pkgFolder = manifestFile.parentFile ?: continue
@@ -283,6 +330,119 @@ class MtzArchiveParser {
             val rawXml = manifestFile.readText()
             val spec = parseFancyIconManifest(pkgName, pkgFolder.absolutePath, rawXml)
             fancyIconSpecs[pkgName] = spec
+        }
+
+        // 5b. Index MTZ Widget Custom Fonts, Clock/Weather Assets, Digit Sprites & Clock MAML Manifest
+        val customFontFile = allFiles.firstOrNull { file ->
+            val ext = file.extension.lowercase()
+            (ext == "ttf" || ext == "otf") && file.length() > 512L
+        }
+        val widgetImages = allFiles.filter { file ->
+            val ext = file.extension.lowercase()
+            val relPath = file.relativeTo(extractedDir).invariantSeparatorsPath
+            (ext == "png" || ext == "webp" || ext == "jpg") &&
+                (relPath.contains("clock_2x4") ||
+                    relPath.contains("clock_3x4") ||
+                    relPath.contains("weather") ||
+                    relPath.contains("com_miui_home") ||
+                    file.nameWithoutExtension.lowercase().startsWith("weather_") ||
+                    file.nameWithoutExtension.lowercase().startsWith("gadget_"))
+        }
+        var widgetBackgroundPath: String? = null
+        var widgetGadgetBgPath: String? = null
+        var widgetGadgetCirclePath: String? = null
+        var widgetGadgetIconPath: String? = null
+        val widgetWeatherIconPaths = mutableMapOf<String, String>()
+        val widgetDigitSpritePaths = mutableMapOf<Char, String>()
+
+        for (wImg in widgetImages) {
+            val lower = wImg.nameWithoutExtension.lowercase().removeSuffix(".9")
+            when {
+                lower == "gadget_clear_button_bg" -> {
+                    widgetGadgetBgPath = wImg.absolutePath
+                }
+                lower == "gadget_clear_button_circle" -> {
+                    widgetGadgetCirclePath = wImg.absolutePath
+                }
+                lower == "gadget_clear_button_fore_normal" || lower == "gadget_power_clear_fore_normal" -> {
+                    if (widgetGadgetIconPath == null) {
+                        widgetGadgetIconPath = wImg.absolutePath
+                    }
+                }
+                widgetBackgroundPath == null &&
+                    !wImg.invariantSeparatorsPath.contains("com_miui_home") &&
+                    (lower.contains("bg") || lower.contains("back") || lower.contains("panel") || lower.contains("plate")) -> {
+                    widgetBackgroundPath = wImg.absolutePath
+                }
+                lower.matches(Regex("^(time_|num_|digit_|clock_)?[0-9]$")) -> {
+                    val digitChar = lower.last()
+                    widgetDigitSpritePaths.putIfAbsent(digitChar, wImg.absolutePath)
+                }
+                lower == "dot" || lower == "colon" || lower == "time_dot" || lower == "time_colon" -> {
+                    widgetDigitSpritePaths.putIfAbsent(':', wImg.absolutePath)
+                }
+                lower == "qing" || lower.contains("sun") || lower.contains("clear") || lower.contains("weather_0") -> {
+                    widgetWeatherIconPaths.putIfAbsent("sunny", wImg.absolutePath)
+                }
+                lower == "yun" || lower == "yin" || lower.contains("cloud") || lower.contains("overcast") || lower.contains("weather_1") || lower.contains("weather_2") -> {
+                    widgetWeatherIconPaths.putIfAbsent("cloudy", wImg.absolutePath)
+                }
+                lower == "yu" || lower.contains("rain") || lower.contains("shower") || lower.contains("storm") || lower.contains("weather_3") -> {
+                    widgetWeatherIconPaths.putIfAbsent("rain", wImg.absolutePath)
+                }
+                lower == "xue" || lower.contains("snow") || lower.contains("ice") -> {
+                    widgetWeatherIconPaths.putIfAbsent("snow", wImg.absolutePath)
+                }
+                lower.contains("night") || lower.contains("moon") -> {
+                    widgetWeatherIconPaths.putIfAbsent("night", wImg.absolutePath)
+                }
+                lower.startsWith("weather") -> {
+                    widgetWeatherIconPaths.putIfAbsent("default", wImg.absolutePath)
+                }
+            }
+        }
+        // Also check directIconsMap for com.miui.weather2 / com.android.deskclock as fallback weather/clock icons
+        directIconsMap["com.miui.weather2"]?.let { widgetWeatherIconPaths.putIfAbsent("default", it) }
+
+        val clock2x4ManifestFile = allFiles.firstOrNull { file ->
+            val relPath = file.relativeTo(extractedDir).invariantSeparatorsPath
+            file.name.equals("manifest.xml", ignoreCase = true) &&
+                !relPath.contains("fancy_icons") &&
+                (relPath.contains("clock_2x4") ||
+                    relPath.contains("clock_2x2") ||
+                    relPath.contains("clock_1x4"))
+        }
+        val clock3x4ManifestFile = allFiles.firstOrNull { file ->
+            val relPath = file.relativeTo(extractedDir).invariantSeparatorsPath
+            file.name.equals("manifest.xml", ignoreCase = true) &&
+                !relPath.contains("fancy_icons") &&
+                relPath.contains("clock_3x4")
+        }
+        val clockWidgetMamlSpec = (clock2x4ManifestFile ?: clock3x4ManifestFile)?.let { mf ->
+            runCatching {
+                val folder = mf.parentFile ?: extractedDir
+                parseFancyIconManifest("clock_2x4", folder.absolutePath, mf.readText())
+            }.getOrNull()
+        }
+        val clock2x4WidgetSpec = clock2x4ManifestFile?.let { mf ->
+            runCatching {
+                val folder = mf.parentFile ?: extractedDir
+                MamlClockWidgetRenderer.parseClockWidgetManifest(
+                    moduleName = "clock_2x4",
+                    directoryPath = folder.absolutePath,
+                    xmlContent = mf.readText()
+                )
+            }.getOrNull()
+        }
+        val clock3x4WidgetSpec = clock3x4ManifestFile?.let { mf ->
+            runCatching {
+                val folder = mf.parentFile ?: extractedDir
+                MamlClockWidgetRenderer.parseClockWidgetManifest(
+                    moduleName = "clock_3x4",
+                    directoryPath = folder.absolutePath,
+                    xmlContent = mf.readText()
+                )
+            }.getOrNull()
         }
 
         // 6. Locate Wallpaper
@@ -350,7 +510,430 @@ class MtzArchiveParser {
             pointsOffsetX = if (hasTransformConfig) parsedTransform.pointsOffsetX else (1f - effectiveIconScale) / 2f,
             pointsOffsetY = if (hasTransformConfig) parsedTransform.pointsOffsetY else (1f - effectiveIconScale) / 2f,
             pointsMappingSrc = parsedTransform.pointsMappingSrc,
-            pointsMappingDst = parsedTransform.pointsMappingDst
+            pointsMappingDst = parsedTransform.pointsMappingDst,
+            dockConfig = parsedDockConfig,
+            rawDockConfigXml = rawDockConfigXml,
+            customFontPath = customFontFile?.absolutePath,
+            widgetBackgroundPath = widgetBackgroundPath,
+            widgetGadgetBgPath = widgetGadgetBgPath,
+            widgetGadgetCirclePath = widgetGadgetCirclePath,
+            widgetGadgetIconPath = widgetGadgetIconPath,
+            widgetWeatherIconPaths = widgetWeatherIconPaths,
+            widgetDigitSpritePaths = widgetDigitSpritePaths,
+            clockWidgetMamlSpec = clockWidgetMamlSpec,
+            clock2x4WidgetSpec = clock2x4WidgetSpec ?: clock3x4WidgetSpec,
+            clock3x4WidgetSpec = clock3x4WidgetSpec ?: clock2x4WidgetSpec
+        )
+    }
+
+    /**
+     * Parses a `<DockConfig>` XML specification from `dock_config.xml`, `transform_config.xml`,
+     * or the user's live XML override in `LauncherEngineConfig.customDockXml`.
+     *
+     * ZERO-CONFIG STOCK MIUI FALLBACK:
+     * If no `<DockConfig>` tag is found in `xmlContent` (or if `enabled="false"`), returns
+     * `DockXmlConfig(isCustomDockEnabled = false)`, leaving the bottom dock as the unmodified
+     * stock MIUI transparent pin bar.
+     */
+    fun parseDockConfigXml(xmlContent: String): DockXmlConfig {
+        if (xmlContent.isBlank() || !xmlContent.contains("<DockConfig", ignoreCase = true)) {
+            return DockXmlConfig(isCustomDockEnabled = false)
+        }
+        val cleanXml = deduplicateXmlTagAttributes(xmlContent)
+
+        var enabled = true
+        var heightDp: Float? = null
+        var marginHorizontalDp = 4f
+        var marginBottomDp = 6f
+        var paddingHorizontalDp = 0f
+        var paddingVerticalDp = 0f
+        var cornerRadiusDp = 24f
+        var topLeftRadiusDp: Float? = null
+        var topRightRadiusDp: Float? = null
+        var bottomLeftRadiusDp: Float? = null
+        var bottomRightRadiusDp: Float? = null
+        var blurRadiusDp = 0f
+        var iconScale = 1.0f
+        var itemSpacingDp = 0f
+
+        var backgroundColorHex: String? = null
+        var gradientStartHex: String? = null
+        var gradientCenterHex: String? = null
+        var gradientEndHex: String? = null
+        var gradientAngle = 90f
+        var backgroundImage: String? = null
+        var backgroundScaleMode = DockImageScaleMode.STRETCH
+        var backgroundAlpha = 1.0f
+
+        var borderWidthDp = 0f
+        var borderColorHex: String? = null
+        var borderGradientStartHex: String? = null
+        var borderGradientEndHex: String? = null
+        var glowColorHex: String? = null
+        var glowRadiusDp = 0f
+        var dashWidthDp = 0f
+        var dashGapDp = 0f
+
+        var defaultSideMode = DockImageScaleMode.STRETCH
+        var defaultSideInset = 0f
+        var defaultSideTint: String? = null
+
+        var topSide: DockSideImageSpec? = null
+        var bottomSide: DockSideImageSpec? = null
+        var leftSide: DockSideImageSpec? = null
+        var rightSide: DockSideImageSpec? = null
+        var cornerTopLeft: DockCornerImageSpec? = null
+        var cornerTopRight: DockCornerImageSpec? = null
+        var cornerBottomLeft: DockCornerImageSpec? = null
+        var cornerBottomRight: DockCornerImageSpec? = null
+
+        var insideDockConfig = false
+
+        fun parseDimenAttr(raw: String?): Float? {
+            if (raw.isNullOrBlank()) return null
+            return raw.lowercase()
+                .replace("dp", "")
+                .replace("px", "")
+                .replace("f", "")
+                .trim()
+                .toFloatOrNull()
+        }
+
+        fun parseAlphaAttr(raw: String?, defaultVal: Float = 1.0f): Float {
+            val f = raw?.trim()?.toFloatOrNull() ?: return defaultVal
+            return if (f > 1.0f) (f / 255f).coerceIn(0f, 1f) else f.coerceIn(0f, 1f)
+        }
+
+        fun attrIgnoreCase(parser: XmlPullParser, vararg names: String): String? {
+            for (i in 0 until parser.attributeCount) {
+                val attrName = parser.getAttributeName(i) ?: continue
+                if (names.any { it.equals(attrName, ignoreCase = true) }) {
+                    return parser.getAttributeValue(i)
+                }
+            }
+            return null
+        }
+
+        fun parseSideTag(parser: XmlPullParser, defaultThickness: Float): DockSideImageSpec? {
+            val src = attrIgnoreCase(parser, "src", "image", "path", "file")?.trim()
+                ?.takeIf { it.isNotEmpty() && !it.equals("none", ignoreCase = true) }
+                ?: return null
+            val thickness = parseDimenAttr(
+                attrIgnoreCase(parser, "height", "width", "thickness", "size")
+            )?.coerceIn(1f, 64f) ?: defaultThickness
+            val mode = attrIgnoreCase(parser, "mode", "scaleType", "scaleMode")
+                ?.let { DockImageScaleMode.fromCode(it) } ?: defaultSideMode
+            val offset = parseDimenAttr(attrIgnoreCase(parser, "offset", "inset"))
+                ?.coerceIn(-32f, 32f) ?: defaultSideInset
+            val tint = attrIgnoreCase(parser, "tint", "color")?.takeIf { it.startsWith("#") } ?: defaultSideTint
+            val alpha = parseAlphaAttr(attrIgnoreCase(parser, "alpha", "opacity"), 1.0f)
+            return DockSideImageSpec(
+                src = src,
+                thicknessDp = thickness,
+                mode = mode,
+                offsetDp = offset,
+                tintHex = tint,
+                alpha = alpha
+            )
+        }
+
+        fun parseCornerTag(parser: XmlPullParser): DockCornerImageSpec? {
+            val src = attrIgnoreCase(parser, "src", "image", "path", "file")?.trim()
+                ?.takeIf { it.isNotEmpty() && !it.equals("none", ignoreCase = true) }
+                ?: return null
+            val size = parseDimenAttr(attrIgnoreCase(parser, "size", "width", "height"))
+                ?.coerceIn(4f, 64f) ?: 14f
+            val offset = parseDimenAttr(attrIgnoreCase(parser, "offset", "inset"))
+                ?.coerceIn(-24f, 24f) ?: defaultSideInset
+            val tint = attrIgnoreCase(parser, "tint", "color")?.takeIf { it.startsWith("#") } ?: defaultSideTint
+            val alpha = parseAlphaAttr(attrIgnoreCase(parser, "alpha", "opacity"), 1.0f)
+            return DockCornerImageSpec(
+                src = src,
+                sizeDp = size,
+                offsetDp = offset,
+                tintHex = tint,
+                alpha = alpha
+            )
+        }
+
+        try {
+            val parser = Xml.newPullParser()
+            parser.setInput(StringReader(cleanXml))
+            var eventType = parser.eventType
+            while (eventType != XmlPullParser.END_DOCUMENT) {
+                when (eventType) {
+                    XmlPullParser.START_TAG -> {
+                        val tag = parser.name ?: ""
+                        when {
+                            tag.equals("DockConfig", ignoreCase = true) -> {
+                                insideDockConfig = true
+                                val enAttr = attrIgnoreCase(parser, "enabled", "enable")
+                                if (enAttr != null) {
+                                    enabled = !enAttr.equals("false", ignoreCase = true) && enAttr != "0"
+                                }
+                                parseDimenAttr(attrIgnoreCase(parser, "height", "dockHeight"))?.let {
+                                    heightDp = it.coerceIn(48f, 140f)
+                                }
+                                parseDimenAttr(attrIgnoreCase(parser, "marginHorizontal", "marginH", "margin"))?.let {
+                                    marginHorizontalDp = it.coerceIn(0f, 48f)
+                                }
+                                parseDimenAttr(attrIgnoreCase(parser, "marginBottom", "marginB"))?.let {
+                                    marginBottomDp = it.coerceIn(0f, 48f)
+                                }
+                                parseDimenAttr(attrIgnoreCase(parser, "paddingHorizontal", "paddingH", "padding"))?.let {
+                                    paddingHorizontalDp = it.coerceIn(0f, 40f)
+                                }
+                                parseDimenAttr(attrIgnoreCase(parser, "paddingVertical", "paddingV"))?.let {
+                                    paddingVerticalDp = it.coerceIn(0f, 32f)
+                                }
+                                parseDimenAttr(attrIgnoreCase(parser, "cornerRadius", "radius"))?.let {
+                                    cornerRadiusDp = it.coerceIn(0f, 64f)
+                                }
+                                parseDimenAttr(attrIgnoreCase(parser, "topLeftRadius"))?.let {
+                                    topLeftRadiusDp = it.coerceIn(0f, 64f)
+                                }
+                                parseDimenAttr(attrIgnoreCase(parser, "topRightRadius"))?.let {
+                                    topRightRadiusDp = it.coerceIn(0f, 64f)
+                                }
+                                parseDimenAttr(attrIgnoreCase(parser, "bottomLeftRadius"))?.let {
+                                    bottomLeftRadiusDp = it.coerceIn(0f, 64f)
+                                }
+                                parseDimenAttr(attrIgnoreCase(parser, "bottomRightRadius"))?.let {
+                                    bottomRightRadiusDp = it.coerceIn(0f, 64f)
+                                }
+                                parseDimenAttr(attrIgnoreCase(parser, "blurRadius", "blur"))?.let {
+                                    blurRadiusDp = it.coerceIn(0f, 40f)
+                                }
+                                parseDimenAttr(attrIgnoreCase(parser, "iconScale", "scale"))?.let {
+                                    iconScale = it.coerceIn(0.5f, 1.25f)
+                                }
+                                parseDimenAttr(attrIgnoreCase(parser, "itemSpacing", "spacing"))?.let {
+                                    itemSpacingDp = it.coerceIn(0f, 24f)
+                                }
+                                // Support shorthand inline background/border attributes directly on <DockConfig>
+                                attrIgnoreCase(parser, "backgroundColor", "bgColor")?.takeIf { it.startsWith("#") }?.let {
+                                    backgroundColorHex = it
+                                }
+                                attrIgnoreCase(parser, "borderColor")?.takeIf { it.startsWith("#") }?.let {
+                                    borderColorHex = it
+                                }
+                                parseDimenAttr(attrIgnoreCase(parser, "borderWidth"))?.let {
+                                    borderWidthDp = it.coerceIn(0f, 12f)
+                                }
+                            }
+                            insideDockConfig && (tag.equals("Background", ignoreCase = true) || tag.equals("DockBackground", ignoreCase = true)) -> {
+                                attrIgnoreCase(parser, "color", "backgroundColor", "solidColor")?.takeIf { it.startsWith("#") }?.let {
+                                    backgroundColorHex = it
+                                }
+                                attrIgnoreCase(parser, "gradientStart", "startColor")?.takeIf { it.startsWith("#") }?.let {
+                                    gradientStartHex = it
+                                }
+                                attrIgnoreCase(parser, "gradientCenter", "centerColor", "midColor")?.takeIf { it.startsWith("#") }?.let {
+                                    gradientCenterHex = it
+                                }
+                                attrIgnoreCase(parser, "gradientEnd", "endColor")?.takeIf { it.startsWith("#") }?.let {
+                                    gradientEndHex = it
+                                }
+                                parseDimenAttr(attrIgnoreCase(parser, "gradientAngle", "angle"))?.let {
+                                    gradientAngle = it
+                                }
+                                attrIgnoreCase(parser, "image", "src", "background")?.trim()
+                                    ?.takeIf { it.isNotEmpty() && !it.equals("none", ignoreCase = true) }?.let {
+                                        backgroundImage = it
+                                    }
+                                attrIgnoreCase(parser, "scaleType", "scaleMode", "mode")?.let {
+                                    backgroundScaleMode = DockImageScaleMode.fromCode(it)
+                                }
+                                attrIgnoreCase(parser, "alpha", "opacity")?.let {
+                                    backgroundAlpha = parseAlphaAttr(it, 1.0f)
+                                }
+                                parseDimenAttr(attrIgnoreCase(parser, "cornerRadius", "radius"))?.let {
+                                    cornerRadiusDp = it.coerceIn(0f, 64f)
+                                }
+                                parseDimenAttr(attrIgnoreCase(parser, "blurRadius", "blur"))?.let {
+                                    blurRadiusDp = it.coerceIn(0f, 40f)
+                                }
+                            }
+                            insideDockConfig && (tag.equals("Border", ignoreCase = true) || tag.equals("DockBorder", ignoreCase = true)) -> {
+                                parseDimenAttr(attrIgnoreCase(parser, "width", "borderWidth", "strokeWidth"))?.let {
+                                    borderWidthDp = it.coerceIn(0f, 12f)
+                                }
+                                attrIgnoreCase(parser, "color", "borderColor", "strokeColor")?.takeIf { it.startsWith("#") }?.let {
+                                    borderColorHex = it
+                                }
+                                attrIgnoreCase(parser, "gradientStart", "startColor")?.takeIf { it.startsWith("#") }?.let {
+                                    borderGradientStartHex = it
+                                }
+                                attrIgnoreCase(parser, "gradientEnd", "endColor")?.takeIf { it.startsWith("#") }?.let {
+                                    borderGradientEndHex = it
+                                }
+                                attrIgnoreCase(parser, "glowColor", "shadowColor")?.takeIf { it.startsWith("#") }?.let {
+                                    glowColorHex = it
+                                }
+                                parseDimenAttr(attrIgnoreCase(parser, "glowRadius", "shadowRadius"))?.let {
+                                    glowRadiusDp = it.coerceIn(0f, 24f)
+                                }
+                                parseDimenAttr(attrIgnoreCase(parser, "dashWidth", "dash"))?.let {
+                                    dashWidthDp = it.coerceIn(0f, 32f)
+                                }
+                                parseDimenAttr(attrIgnoreCase(parser, "dashGap", "gap"))?.let {
+                                    dashGapDp = it.coerceIn(0f, 32f)
+                                }
+                                parseDimenAttr(attrIgnoreCase(parser, "cornerRadius", "radius"))?.let {
+                                    cornerRadiusDp = it.coerceIn(0f, 64f)
+                                }
+                            }
+                            insideDockConfig && (
+                                tag.equals("SideImages", ignoreCase = true) ||
+                                    tag.equals("Images", ignoreCase = true) ||
+                                    tag.equals("FrameImages", ignoreCase = true)
+                                ) -> {
+                                attrIgnoreCase(parser, "mode", "scaleMode", "scaleType")?.let {
+                                    defaultSideMode = DockImageScaleMode.fromCode(it)
+                                }
+                                parseDimenAttr(attrIgnoreCase(parser, "inset", "offset"))?.let {
+                                    defaultSideInset = it.coerceIn(-32f, 32f)
+                                }
+                                attrIgnoreCase(parser, "tint", "color")?.takeIf { it.startsWith("#") }?.let {
+                                    defaultSideTint = it
+                                }
+                                val defaultThickness = parseDimenAttr(attrIgnoreCase(parser, "thickness", "size"))?.coerceIn(1f, 48f) ?: 8f
+                                // Also support inline attributes on <SideImages top="..." bottom="..." left="..." right="..." />
+                                attrIgnoreCase(parser, "top", "topImage")?.takeIf { it.isNotBlank() }?.let { src ->
+                                    topSide = DockSideImageSpec(src, defaultThickness, defaultSideMode, defaultSideInset, defaultSideTint)
+                                }
+                                attrIgnoreCase(parser, "bottom", "bottomImage")?.takeIf { it.isNotBlank() }?.let { src ->
+                                    bottomSide = DockSideImageSpec(src, defaultThickness, defaultSideMode, defaultSideInset, defaultSideTint)
+                                }
+                                attrIgnoreCase(parser, "left", "leftImage")?.takeIf { it.isNotBlank() }?.let { src ->
+                                    leftSide = DockSideImageSpec(src, defaultThickness, defaultSideMode, defaultSideInset, defaultSideTint)
+                                }
+                                attrIgnoreCase(parser, "right", "rightImage")?.takeIf { it.isNotBlank() }?.let { src ->
+                                    rightSide = DockSideImageSpec(src, defaultThickness, defaultSideMode, defaultSideInset, defaultSideTint)
+                                }
+                            }
+                            insideDockConfig && (tag.equals("Top", ignoreCase = true) || tag.equals("TopImage", ignoreCase = true)) -> {
+                                topSide = parseSideTag(parser, 6f) ?: topSide
+                            }
+                            insideDockConfig && (tag.equals("Bottom", ignoreCase = true) || tag.equals("BottomImage", ignoreCase = true)) -> {
+                                bottomSide = parseSideTag(parser, 6f) ?: bottomSide
+                            }
+                            insideDockConfig && (tag.equals("Left", ignoreCase = true) || tag.equals("LeftImage", ignoreCase = true)) -> {
+                                leftSide = parseSideTag(parser, 6f) ?: leftSide
+                            }
+                            insideDockConfig && (tag.equals("Right", ignoreCase = true) || tag.equals("RightImage", ignoreCase = true)) -> {
+                                rightSide = parseSideTag(parser, 6f) ?: rightSide
+                            }
+                            insideDockConfig && (tag.equals("AllSides", ignoreCase = true) || tag.equals("FourSides", ignoreCase = true)) -> {
+                                val sideSpec = parseSideTag(parser, 6f)
+                                if (sideSpec != null) {
+                                    topSide = sideSpec
+                                    bottomSide = sideSpec
+                                    leftSide = sideSpec
+                                    rightSide = sideSpec
+                                }
+                            }
+                            insideDockConfig && tag.equals("Corners", ignoreCase = true) -> {
+                                val cornerSpec = parseCornerTag(parser)
+                                if (cornerSpec != null) {
+                                    cornerTopLeft = cornerSpec
+                                    cornerTopRight = cornerSpec
+                                    cornerBottomLeft = cornerSpec
+                                    cornerBottomRight = cornerSpec
+                                }
+                            }
+                            insideDockConfig && tag.equals("CornerTopLeft", ignoreCase = true) -> {
+                                cornerTopLeft = parseCornerTag(parser) ?: cornerTopLeft
+                            }
+                            insideDockConfig && tag.equals("CornerTopRight", ignoreCase = true) -> {
+                                cornerTopRight = parseCornerTag(parser) ?: cornerTopRight
+                            }
+                            insideDockConfig && tag.equals("CornerBottomLeft", ignoreCase = true) -> {
+                                cornerBottomLeft = parseCornerTag(parser) ?: cornerBottomLeft
+                            }
+                            insideDockConfig && tag.equals("CornerBottomRight", ignoreCase = true) -> {
+                                cornerBottomRight = parseCornerTag(parser) ?: cornerBottomRight
+                            }
+                            insideDockConfig && tag.equals("Layout", ignoreCase = true) -> {
+                                parseDimenAttr(attrIgnoreCase(parser, "height", "dockHeight"))?.let {
+                                    heightDp = it.coerceIn(48f, 140f)
+                                }
+                                parseDimenAttr(attrIgnoreCase(parser, "marginHorizontal", "marginH"))?.let {
+                                    marginHorizontalDp = it.coerceIn(0f, 48f)
+                                }
+                                parseDimenAttr(attrIgnoreCase(parser, "marginBottom", "marginB"))?.let {
+                                    marginBottomDp = it.coerceIn(0f, 48f)
+                                }
+                                parseDimenAttr(attrIgnoreCase(parser, "paddingHorizontal", "paddingH"))?.let {
+                                    paddingHorizontalDp = it.coerceIn(0f, 40f)
+                                }
+                                parseDimenAttr(attrIgnoreCase(parser, "paddingVertical", "paddingV"))?.let {
+                                    paddingVerticalDp = it.coerceIn(0f, 32f)
+                                }
+                                parseDimenAttr(attrIgnoreCase(parser, "iconScale", "scale"))?.let {
+                                    iconScale = it.coerceIn(0.5f, 1.25f)
+                                }
+                                parseDimenAttr(attrIgnoreCase(parser, "itemSpacing", "spacing"))?.let {
+                                    itemSpacingDp = it.coerceIn(0f, 24f)
+                                }
+                            }
+                        }
+                    }
+                    XmlPullParser.END_TAG -> {
+                        if (parser.name.equals("DockConfig", ignoreCase = true)) {
+                            insideDockConfig = false
+                        }
+                    }
+                }
+                eventType = parser.next()
+            }
+        } catch (_: Exception) {
+            return DockXmlConfig(isCustomDockEnabled = false)
+        }
+
+        if (!enabled) {
+            return DockXmlConfig(isCustomDockEnabled = false)
+        }
+
+        return DockXmlConfig(
+            isCustomDockEnabled = true,
+            heightDp = heightDp,
+            marginHorizontalDp = marginHorizontalDp,
+            marginBottomDp = marginBottomDp,
+            paddingHorizontalDp = paddingHorizontalDp,
+            paddingVerticalDp = paddingVerticalDp,
+            cornerRadiusDp = cornerRadiusDp,
+            topLeftRadiusDp = topLeftRadiusDp,
+            topRightRadiusDp = topRightRadiusDp,
+            bottomLeftRadiusDp = bottomLeftRadiusDp,
+            bottomRightRadiusDp = bottomRightRadiusDp,
+            blurRadiusDp = blurRadiusDp,
+            iconScale = iconScale,
+            itemSpacingDp = itemSpacingDp,
+            backgroundColorHex = backgroundColorHex,
+            gradientStartHex = gradientStartHex,
+            gradientCenterHex = gradientCenterHex,
+            gradientEndHex = gradientEndHex,
+            gradientAngle = gradientAngle,
+            backgroundImage = backgroundImage,
+            backgroundScaleMode = backgroundScaleMode,
+            backgroundAlpha = backgroundAlpha,
+            borderWidthDp = borderWidthDp,
+            borderColorHex = borderColorHex,
+            borderGradientStartHex = borderGradientStartHex,
+            borderGradientEndHex = borderGradientEndHex,
+            glowColorHex = glowColorHex,
+            glowRadiusDp = glowRadiusDp,
+            dashWidthDp = dashWidthDp,
+            dashGapDp = dashGapDp,
+            topSide = topSide,
+            bottomSide = bottomSide,
+            leftSide = leftSide,
+            rightSide = rightSide,
+            cornerTopLeft = cornerTopLeft,
+            cornerTopRight = cornerTopRight,
+            cornerBottomLeft = cornerBottomLeft,
+            cornerBottomRight = cornerBottomRight
         )
     }
 
@@ -1151,6 +1734,7 @@ class MtzArchiveParser {
         var frameRate = 30
         val layers = mutableListOf<MamlLayerSpec>()
         val variables = linkedMapOf<String, MamlVarAnimation>()
+        val scalarVariables = mutableListOf<com.example.domain.model.MamlVarDef>()
 
         var currentVarName: String? = null
         val currentVarFrames = mutableListOf<MamlAniFrame>()
@@ -1177,6 +1761,19 @@ class MtzArchiveParser {
                             }
                             "Var" -> {
                                 currentVarName = parser.getAttributeValue(null, "name")
+                                val expr = parser.getAttributeValue(null, "expression")
+                                val type = parser.getAttributeValue(null, "type") ?: "number"
+                                val isConst = parser.getAttributeValue(null, "const").equals("true", ignoreCase = true)
+                                if (!currentVarName.isNullOrBlank() && !expr.isNullOrBlank()) {
+                                    scalarVariables.add(
+                                        com.example.domain.model.MamlVarDef(
+                                            name = currentVarName!!,
+                                            expression = expr,
+                                            isString = type.equals("string", ignoreCase = true),
+                                            isConst = isConst
+                                        )
+                                    )
+                                }
                                 currentVarFrames.clear()
                                 currentEaseType = "Linear"
                             }
@@ -1192,12 +1789,15 @@ class MtzArchiveParser {
                                 }
                             }
                             "Group" -> {
-                                val wExpr = parser.getAttributeValue(null, "w")
-                                val hExpr = parser.getAttributeValue(null, "h")
+                                val wExpr = parser.getAttributeValue(null, "w") ?: parser.getAttributeValue(null, "width")
+                                val hExpr = parser.getAttributeValue(null, "h") ?: parser.getAttributeValue(null, "height")
                                 val clip = parser.getAttributeValue(null, "clip").equals("true", ignoreCase = true)
                                 val layered = parser.getAttributeValue(null, "layered").equals("true", ignoreCase = true)
                                 val xExpr = parser.getAttributeValue(null, "x")
                                 val yExpr = parser.getAttributeValue(null, "y")
+                                val align = parser.getAttributeValue(null, "align") ?: "left"
+                                val alignV = parser.getAttributeValue(null, "alignV") ?: "top"
+                                val visExpr = parser.getAttributeValue(null, "visibility")
                                 layers.add(
                                     MamlLayerSpec(
                                         name = "group_start",
@@ -1206,6 +1806,9 @@ class MtzArchiveParser {
                                         yExpression = yExpr,
                                         widthExpression = wExpr,
                                         heightExpression = hExpr,
+                                        alignAttr = align,
+                                        alignVAttr = alignV,
+                                        visibilityExpression = visExpr,
                                         groupClip = clip,
                                         groupLayered = layered
                                     )
@@ -1213,21 +1816,26 @@ class MtzArchiveParser {
                             }
                             "Image" -> {
                                 val src = parser.getAttributeValue(null, "src")
+                                val srcExp = parser.getAttributeValue(null, "srcExp")
+                                val srcidExpr = parser.getAttributeValue(null, "srcid")
+                                val visExpr = parser.getAttributeValue(null, "visibility")
                                 val name = parser.getAttributeValue(null, "name") ?: src ?: "layer"
                                 val xExpr = parser.getAttributeValue(null, "x")
                                 val yExpr = parser.getAttributeValue(null, "y")
-                                val pivotXExpr = parser.getAttributeValue(null, "pivotX")
-                                val pivotYExpr = parser.getAttributeValue(null, "pivotY")
+                                val pivotXExpr = parser.getAttributeValue(null, "pivotX") ?: parser.getAttributeValue(null, "centerX")
+                                val pivotYExpr = parser.getAttributeValue(null, "pivotY") ?: parser.getAttributeValue(null, "centerY")
                                 val scaleExpr = parser.getAttributeValue(null, "scale")
                                 val scaleXExpr = parser.getAttributeValue(null, "scaleX")
                                 val scaleYExpr = parser.getAttributeValue(null, "scaleY")
-                                val rotation = parser.getAttributeValue(null, "rotation")
+                                val rotation = parser.getAttributeValue(null, "rotation") ?: parser.getAttributeValue(null, "angle")
                                 val alphaExpr = parser.getAttributeValue(null, "alpha")
                                 val xfermode = parser.getAttributeValue(null, "xfermode")
-                                val alignV = parser.getAttributeValue(null, "alignV") ?: "center"
-                                val align = parser.getAttributeValue(null, "align") ?: "center"
-                                val x = xExpr?.toFloatOrNull() ?: (width / 2f)
-                                val y = yExpr?.toFloatOrNull() ?: (height / 2f)
+                                val align = parser.getAttributeValue(null, "align")
+                                    ?: if (xExpr == null) "center" else "left"
+                                val alignV = parser.getAttributeValue(null, "alignV")
+                                    ?: if (yExpr == null) "center" else "top"
+                                val x = xExpr?.toFloatOrNull() ?: if (align.equals("center", true)) (width / 2f) else 0f
+                                val y = yExpr?.toFloatOrNull() ?: if (alignV.equals("center", true)) (height / 2f) else 0f
                                 val pivotX = pivotXExpr?.toFloatOrNull() ?: (width / 2f)
                                 val pivotY = pivotYExpr?.toFloatOrNull() ?: (height / 2f)
                                 val alpha = alphaExpr?.toIntOrNull()?.coerceIn(0, 255) ?: 255
@@ -1236,6 +1844,9 @@ class MtzArchiveParser {
                                         name = name,
                                         layerType = "IMAGE",
                                         imageFileName = src,
+                                        srcExp = srcExp,
+                                        srcidExpression = srcidExpr,
+                                        visibilityExpression = visExpr,
                                         centerX = x,
                                         centerY = y,
                                         pivotX = pivotX,
@@ -1258,6 +1869,44 @@ class MtzArchiveParser {
                                     )
                                 )
                             }
+                            "ImageNumber", "ImageChars", "Time" -> {
+                                val isTimeTag = parser.name.equals("Time", ignoreCase = true)
+                                val src = parser.getAttributeValue(null, "src")
+                                val srcExp = parser.getAttributeValue(null, "srcExp")
+                                val name = parser.getAttributeValue(null, "name") ?: src ?: "img_num"
+                                val xExpr = parser.getAttributeValue(null, "x")
+                                val yExpr = parser.getAttributeValue(null, "y")
+                                val numberExpr = parser.getAttributeValue(null, "number")
+                                    ?: parser.getAttributeValue(null, "string")
+                                    ?: if (isTimeTag) "#date" else null
+                                val spaceExpr = parser.getAttributeValue(null, "space")
+                                val alphaExpr = parser.getAttributeValue(null, "alpha")
+                                val visExpr = parser.getAttributeValue(null, "visibility")
+                                val align = parser.getAttributeValue(null, "align") ?: "left"
+                                val alignV = parser.getAttributeValue(null, "alignV") ?: "top"
+                                val x = xExpr?.toFloatOrNull() ?: 0f
+                                val y = yExpr?.toFloatOrNull() ?: 0f
+                                layers.add(
+                                    MamlLayerSpec(
+                                        name = name,
+                                        layerType = "IMAGE_NUMBER",
+                                        imageFileName = src,
+                                        srcExp = srcExp,
+                                        centerX = x,
+                                        centerY = y,
+                                        xExpression = xExpr,
+                                        yExpression = yExpr,
+                                        alphaExpression = alphaExpr,
+                                        visibilityExpression = visExpr,
+                                        numberExpression = numberExpr,
+                                        spaceExpression = spaceExpr,
+                                        alignVCenter = alignV.equals("center", true),
+                                        alignHCenter = align.equals("center", true),
+                                        alignAttr = align,
+                                        alignVAttr = alignV
+                                    )
+                                )
+                            }
                             "Rectangle" -> {
                                 val name = parser.getAttributeValue(null, "name") ?: "rect_layer"
                                 val xExpr = parser.getAttributeValue(null, "x")
@@ -1268,6 +1917,7 @@ class MtzArchiveParser {
                                 val pivotYExpr = parser.getAttributeValue(null, "pivotY")
                                 val rotation = parser.getAttributeValue(null, "rotation")
                                 val alphaExpr = parser.getAttributeValue(null, "alpha")
+                                val visExpr = parser.getAttributeValue(null, "visibility")
                                 val cornerRadius = parser.getAttributeValue(null, "cornerRadius")?.toFloatOrNull() ?: 0f
                                 val fillColor = parser.getAttributeValue(null, "fillColor") ?: "#000000"
                                 val align = parser.getAttributeValue(null, "align") ?: "left"
@@ -1292,6 +1942,7 @@ class MtzArchiveParser {
                                         heightExpression = hExpr,
                                         rotationExpression = rotation,
                                         alphaExpression = alphaExpr,
+                                        visibilityExpression = visExpr,
                                         alignVCenter = alignV.equals("center", true),
                                         alignHCenter = align.equals("center", true),
                                         alignAttr = align,
@@ -1307,6 +1958,7 @@ class MtzArchiveParser {
                                 val xExpr = parser.getAttributeValue(null, "x")
                                 val yExpr = parser.getAttributeValue(null, "y")
                                 val alphaExpr = parser.getAttributeValue(null, "alpha")
+                                val visExpr = parser.getAttributeValue(null, "visibility")
                                 val x = xExpr?.toFloatOrNull() ?: (width / 2f)
                                 val y = yExpr?.toFloatOrNull() ?: (height / 2f)
                                 val exp = parser.getAttributeValue(null, "format")
@@ -1328,6 +1980,7 @@ class MtzArchiveParser {
                                         xExpression = xExpr,
                                         yExpression = yExpr,
                                         alphaExpression = alphaExpr,
+                                        visibilityExpression = visExpr,
                                         textExpression = exp,
                                         textColorHex = color,
                                         textSizePx = size,
@@ -1376,7 +2029,13 @@ class MtzArchiveParser {
         val isLive = lowerPkg.contains("clock") ||
             lowerPkg.contains("calendar") ||
             lowerPkg.contains("weather") ||
-            layers.any { it.layerType == "RECTANGLE" || it.layerType == "DATETIME" || it.layerType == "TEXT" }
+            layers.any {
+                it.layerType == "RECTANGLE" ||
+                    it.layerType == "DATETIME" ||
+                    it.layerType == "TEXT" ||
+                    it.layerType == "IMAGE_NUMBER" ||
+                    !it.srcidExpression.isNullOrBlank()
+            }
 
         return MamlFancyIconSpec(
             targetPackage = targetPackage,
@@ -1387,6 +2046,7 @@ class MtzArchiveParser {
             layers = layers,
             rawManifestXml = xmlContent,
             variables = variables,
+            scalarVariables = scalarVariables,
             quietImagePath = quietFile?.absolutePath,
             startImagePath = startFile?.absolutePath,
             isLiveClockOrCalendar = isLive
@@ -1398,12 +2058,18 @@ class MtzArchiveParser {
      * so `XmlPullParser` does not abort on hand-authored MAML manifests (e.g. duplicate `alpha` or `pivotX`).
      */
     private fun deduplicateXmlTagAttributes(xml: String): String {
-        val tagRegex = Regex("<([A-Za-z_][A-Za-z0-9_.:-]*)(\\s+[^>]*?)?(/?>)")
+        val withoutComments = xml.replace(Regex("<!--[\\s\\S]*?-->"), "")
+        val spacedAttrs = withoutComments.replace(
+            Regex("(\"[^\"]*\"|'[^']*')([A-Za-z_][A-Za-z0-9_.:-]*\\s*=)"),
+            "$1 $2"
+        )
+        val tagRegex = Regex("<([A-Za-z_][A-Za-z0-9_.:-]*)(\\s+(?:\"[^\"]*\"|'[^']*'|[^/>\"'])*)?(/?>)")
         val attrRegex = Regex("([A-Za-z_][A-Za-z0-9_.:-]*)\\s*=\\s*(\"[^\"]*\"|'[^']*')")
-        return tagRegex.replace(xml) { match ->
+        return tagRegex.replace(spacedAttrs) { match ->
             val tagName = match.groupValues[1]
             val attrBlock = match.groupValues[2]
             val closeToken = match.groupValues[3]
+            val finalCloseToken = if (closeToken == "/>" || attrBlock.trimEnd().endsWith("/")) "/>" else ">"
             if (attrBlock.isBlank()) {
                 match.value
             } else {
@@ -1422,7 +2088,7 @@ class MtzArchiveParser {
                         for ((k, v) in attrs) {
                             append(' ').append(k).append('=').append(v)
                         }
-                        append(closeToken)
+                        append(finalCloseToken)
                     }
                 }
             }

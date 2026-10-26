@@ -1092,5 +1092,149 @@ class ExampleRobolectricTest {
             db.close()
         }
     }
+
+    @Test
+    fun `notification badge count is zero by default and maml clock_2x4 and clock_3x4 scene graphs parse and render`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+
+        // 1. Verify no default fake "20" badge appears on SMS/Messaging when no live notification exists
+        assertEquals(
+            0,
+            com.example.service.LauncherNotificationListenerService.resolveNotificationBadgeCount(
+                packageName = "com.android.mms",
+                activeCounts = emptyMap()
+            )
+        )
+        assertEquals(
+            20,
+            com.example.service.LauncherNotificationListenerService.resolveNotificationBadgeCount(
+                packageName = "com.android.mms",
+                activeCounts = mapOf("com.android.mms" to 20)
+            )
+        )
+
+        // 2. Parse & render real I.C.H.O.L.S.mtz and theme2.mtz clock_2x4 / clock_3x4 archives
+        val parser = com.example.mtz.MtzArchiveParser()
+        val renderer = com.example.mtz.MamlClockWidgetRenderer()
+        val telemetry = DeviceTelemetrySnapshot(
+            weatherTempCelsius = 21,
+            weatherCondition = "Overcast",
+            weatherCity = "Tokyo"
+        )
+
+        val icholsFile = File("../I.C.H.O.L.S.mtz").takeIf { it.isFile } ?: File("I.C.H.O.L.S.mtz")
+        if (icholsFile.isFile) {
+            val outDir = File(context.cacheDir, "test_ichols_extract")
+            val meta = icholsFile.inputStream().use { stream ->
+                parser.parseAndExtractMtzStream(stream, "ichols", "I.C.H.O.L.S.mtz", outDir, false)
+            }
+            assertNotNull("I.C.H.O.L.S.mtz must parse clock2x4WidgetSpec", meta.clock2x4WidgetSpec)
+            val spec = meta.clock2x4WidgetSpec!!
+            assertEquals(3, spec.stringVarArrays.size)
+            val bmp = renderer.renderWidgetBitmap(spec, 640, 320, 1716526380000L, telemetry)
+            assertEquals(640, bmp.width)
+            assertEquals(320, bmp.height)
+            outDir.deleteRecursively()
+        }
+
+        val theme2File = File("../theme2.mtz").takeIf { it.isFile } ?: File("theme2.mtz")
+        if (theme2File.isFile) {
+            val outDir = File(context.cacheDir, "test_theme2_extract")
+            val meta = theme2File.inputStream().use { stream ->
+                parser.parseAndExtractMtzStream(stream, "theme2", "theme2.mtz", outDir, false)
+            }
+            assertNotNull("theme2.mtz must parse clock2x4WidgetSpec", meta.clock2x4WidgetSpec)
+            assertNotNull("theme2.mtz must parse clock3x4WidgetSpec", meta.clock3x4WidgetSpec)
+            val bmp2x4 = renderer.renderWidgetBitmap(meta.clock2x4WidgetSpec!!, 640, 300, 1716526380000L, telemetry)
+            val bmp3x4 = renderer.renderWidgetBitmap(meta.clock3x4WidgetSpec!!, 640, 480, 1716526380000L, telemetry)
+            assertEquals(640, bmp2x4.width)
+            assertEquals(640, bmp3x4.width)
+            outDir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `dark fate mtz parses clock_2x4 Time digits calendar srcid fancy_icon folder plate gadget assets and global widget theme mixing`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val parser = com.example.mtz.MtzArchiveParser()
+        val clockRenderer = com.example.mtz.MamlClockWidgetRenderer()
+        val iconEngine = com.example.mtz.XiaomiIconRenderEngine()
+
+        val darkFateName = "DARKFATE+752cc485-7f8d-488c-bca5-32d57c10ccc0+www.mtzfile.pw+MIUI12+-THEME.mtz"
+        val darkFateFile = File("../$darkFateName").takeIf { it.isFile } ?: File(darkFateName)
+        if (!darkFateFile.isFile) return
+
+        val outDir = File(context.cacheDir, "test_darkfate_extract")
+        if (outDir.exists()) outDir.deleteRecursively()
+
+        val meta = darkFateFile.inputStream().use { stream ->
+            parser.parseAndExtractMtzStream(stream, "darkfate", darkFateName, outDir, false)
+        }
+
+        // 1. Verify no macOS AppleDouble ._* resource fork files polluted the extracted directory or directIconsMap
+        assertTrue(
+            "directIconsMap must not contain any ._* AppleDouble files",
+            meta.directIconsMap.keys.none { it.startsWith("._") }
+        )
+
+        // 2. Verify icon_folder.png is indexed on Dark Fate, and com.miui.home gadget assets on theme2.mtz
+        assertNotNull("Dark Fate icon_folder.png must be indexed", meta.iconFolderPath)
+        val theme2GadgetFile = File("../theme2.mtz").takeIf { it.isFile } ?: File("theme2.mtz")
+        if (theme2GadgetFile.isFile) {
+            val theme2Dir = File(context.cacheDir, "test_theme2_gadget_extract")
+            val theme2Meta = theme2GadgetFile.inputStream().use { s ->
+                parser.parseAndExtractMtzStream(s, "theme2_gadget", "theme2.mtz", theme2Dir, false)
+            }
+            assertNotNull("theme2.mtz gadget_clear_button_circle.9.png must be indexed", theme2Meta.widgetGadgetCirclePath)
+            assertNotNull("theme2.mtz gadget_clear_button_fore_normal.png must be indexed", theme2Meta.widgetGadgetIconPath)
+            theme2Dir.deleteRecursively()
+        }
+
+        // 3. Verify fancy_icons/com.android.calendar with srcid="#date" renders a visible calendar icon
+        val calSpec = meta.fancyIconSpecs["com.android.calendar"]
+        assertNotNull("Dark Fate fancy_icons/com.android.calendar must be parsed", calSpec)
+        val calBmp = iconEngine.renderMamlFancyIcon(
+            spec = calSpec!!,
+            calendar = java.util.Calendar.getInstance(),
+            animTimeMs = 0L
+        )
+        assertNotNull("Calendar fancy icon with srcid=#date must render non-null bitmap", calBmp)
+        val calCenterAlpha = Color.alpha(calBmp!!.getPixel(96, 96))
+        assertTrue("Calendar fancy icon center pixel must be visible (alpha=$calCenterAlpha)", calCenterAlpha > 150)
+
+        // 4. Verify clock_2x4 parses <Time> tags and renders visible time & date digits
+        val clockSpec = meta.clock2x4WidgetSpec
+        assertNotNull("Dark Fate clock_2x4 must be parsed", clockSpec)
+        val sanitizedPreview = com.example.mtz.MamlClockWidgetRenderer.sanitizeMamlClockXml(clockSpec!!.rawManifestXml)
+        assertTrue(
+            "Dark Fate clock_2x4 must parse <Time> tags as ImageNumberNodes (nodes=${clockSpec.nodes.map { it::class.simpleName }}, vars=${clockSpec.variables.map { it.name }}, sanitized=$sanitizedPreview)",
+            clockSpec.nodes.any { it is com.example.domain.model.MamlWidgetNode.ImageNumberNode }
+        )
+        val telemetry = DeviceTelemetrySnapshot(
+            weatherTempCelsius = 20,
+            weatherCondition = "Sunny",
+            weatherCity = "Moscow"
+        )
+        val clockBmp = clockRenderer.renderWidgetBitmap(clockSpec, 640, 320, 1716526380000L, telemetry)
+        assertEquals(640, clockBmp.width)
+        assertEquals(320, clockBmp.height)
+
+        var nonTransparentClockPixels = 0
+        for (y in 40 until 260 step 4) {
+            for (x in 120 until 520 step 4) {
+                if (Color.alpha(clockBmp.getPixel(x, y)) > 40) {
+                    nonTransparentClockPixels++
+                }
+            }
+        }
+        assertTrue(
+            "Dark Fate clock_2x4 rendered bitmap must contain visible clock & date pixels (got $nonTransparentClockPixels)",
+            nonTransparentClockPixels > 80
+        )
+
+        outDir.deleteRecursively()
+    }
 }
+
+
 
